@@ -17,17 +17,20 @@ This repo will also host any processing scripts, though the Luxonis cameras have
 
 These are running off a [Raspberry Pi 3B+](https://www.raspberrypi.com/products/raspberry-pi-3-model-b-plus/), so we're already a few years old, but that's ok.
 
- - running [micromamba](https://mamba.readthedocs.io/en/latest/installation.html#micromamba)
+ - running [Mambaforge](https://github.com/conda-forge/miniforge#mambaforge)
    - mamba 0.24.0
    - conda 4.13.0
    - python 3.9.13
  - DepthAI [install instructions](https://docs.luxonis.com/projects/api/en/latest/install/#raspberry-pi-os) for Raspberry Pi OS (in practice, this ends up using system tools, and so all it needs is basic Python + pip)
  - [imagezmq](https://github.com/jeffbass/imagezmq#dependencies-and-installation)
    - This hasn't been updated in a bit -- am hoping to submit some PRs as this progresses -- but it still works, even with the current versions of all the dependencies listed
-   - `pip install imutils pyzmq imagezmq`
-   - `apt-get install python3-opencv`
+   - `pip install imagezmq`
+   - used conda-forge versions of `opencv`, `pip`, and `pyzmq`
  - [PiCamera2](https://github.com/raspberrypi/picamera2#picamera2-on-pi-3-and-ealier-devices)
-   - `apt-get install python3-libcamera python3-kms++`
-   - `NOGUI=1 pip install picamera2`
+   - `apt-get install build-essential python3-libcamera python3-kms++`
+   - `mamba install piexif pillow`
+   - `pip install pidng simplejpeg v4l2-python3 python-prctl`
+   - `pip install --no-deps picamera2`
+   - the final step here involved setting symlinks for `pykms` and `libcamera` inside the `${MAMBA_ROOT}`
 
 This initializes a default environment that works well with both PiCamera2 and DepthAI devices.
