@@ -18,8 +18,8 @@ This repo will also host any processing scripts, though the Luxonis cameras have
 These are running off a [Raspberry Pi 3B+](https://www.raspberrypi.com/products/raspberry-pi-3-model-b-plus/), so we're already a few years old, but that's ok.
 
  - running [Mambaforge](https://github.com/conda-forge/miniforge#mambaforge)
-   - mamba 0.24.0
-   - conda 4.13.0
+   - mamba 0.27.0
+   - conda 22.9.0
    - python 3.9.13
  - DepthAI [install instructions](https://docs.luxonis.com/projects/api/en/latest/install/#raspberry-pi-os) for Raspberry Pi OS (in practice, this ends up using system tools, and so all it needs is basic Python + pip)
  - [imagezmq](https://github.com/jeffbass/imagezmq#dependencies-and-installation)
@@ -34,3 +34,13 @@ These are running off a [Raspberry Pi 3B+](https://www.raspberrypi.com/products/
    - the final step here involved setting symlinks for `pykms` and `libcamera` inside the `${MAMBA_ROOT}`
 
 This initializes a default environment that works well with both PiCamera2 and DepthAI devices.
+
+## Troubleshooting
+
+### New versions of Picamera2
+
+A common problem I've been running into is that, when a new version of Picamera2 is released, the previous versions break--even to the point of not being able to ask the version that's installed to compare against the newest version. 
+
+However, [a recent change is that the group is now releasing the latest Picamera2 as apt packages](https://github.com/raspberrypi/picamera2/issues/303). They're still available on PyPI--and I'm continuing to use them there, too--but evidently this seems to be the long-term way forward.
+
+For the time being, though, continuing to use `pip install -U --no-deps picamera2` seems to work.
