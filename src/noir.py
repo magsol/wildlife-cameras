@@ -53,7 +53,7 @@ encoding = False
 ltime = 0
 curr = time.time()
 # end = curr + (60 * 60 * 8) # Record for 8 hours.
-end = 60 # record for one minute
+end = curr + 60 # record for one minute
 
 frames = []
 while curr < end:
