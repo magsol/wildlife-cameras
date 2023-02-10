@@ -39,12 +39,12 @@ picam2 = Picamera2()
 picam2.pre_callback = apply_timestamp
 video_config = picam2.create_video_configuration(
     main={"size": hsize, "format": "RGB888"},
-    lores={"size": lsize, "format": "RGB888"})
+    lores={"size": lsize, "format": "YUV420"})
 picam2.configure(video_config)
 encoder = H264Encoder(1000000, repeat=True)
 encoder.output = CircularOutput()
 picam2.encoder = encoder
-picam2.start_encoder()
+#picam2.start_encoder()
 picam2.start()
 
 w, h = lsize
@@ -59,6 +59,7 @@ frames = []
 while curr < end:
     frame = picam2.capture_array("lores")
     frames.append(frame)
+    curr = time.time()
 
 # while True:
 #     curr = picam2.capture_array("lores")
@@ -81,5 +82,5 @@ while curr < end:
 #                 encoding = False
 #     prev = curr
 
-picam2.stop_encoder()
+#picam2.stop_encoder()
 np.save("video.npy", np.array(frames))
