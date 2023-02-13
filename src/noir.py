@@ -51,8 +51,8 @@ picam2.start_encoder()
 prev_gray = None
 encoding = False
 curr_time = time.time()
-#end_time = curr + (60 * 60 * 8) # Record for 8 hours.
-end_time = curr + (60 * 10) # Record for 10 minutes.
+#end_time = curr_time + (60 * 60 * 8) # Record for 8 hours.
+end_time = curr_time + (60 * 10) # Record for 10 minutes.
 ltime = 0
 mses = []
 
