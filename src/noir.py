@@ -68,7 +68,7 @@ mses = []
 
 while curr_time < end_time:
     curr_frame = picam2.capture_array("lores")
-    curr_gray = cv2.cvtColor(frame, cv2.COLOR_YUV420P2GRAY)
+    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_YUV420P2GRAY)
     if prev_gray is not None:
         # Measure pixels differences between current and
         # previous frame
