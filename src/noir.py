@@ -30,9 +30,10 @@ def apply_timestamp(request):
             thickness = thickness
         )
 
+#native = (3280, 2464)
 #lsize = (640, 480)
 #hsize = (1920, 1080)
-lsize = (320, 240)
+lsize = (410, 308)
 hsize = (1280, 720)
 
 picam2 = Picamera2()
@@ -47,18 +48,24 @@ picam2.encoder = encoder
 #picam2.start_encoder()
 picam2.start()
 
-w, h = lsize
 prev = None
 encoding = False
 ltime = 0
 curr = time.time()
 # end = curr + (60 * 60 * 8) # Record for 8 hours.
-end = curr + 60 # record for one minute
+end = curr + 5 # record for five seconds
 
-frames = []
+m_frames = []
+l_frames = []
+metadata = []
 while curr < end:
-    frame = picam2.capture_array("lores")
-    frames.append(frame)
+    #frame = picam2.capture_array("lores")
+    #frame = cv2.cvtColor(frame, cv2.COLOR_YUV420P2GRAY)
+    #frames.append(frame)
+    (main, lores), m = picam2.capture_arrays(["main", "lores"])
+    m_frames.append(main)
+    l_frames.append(lores)
+    metadata.append(m)
     curr = time.time()
 
 # while True:
@@ -83,4 +90,6 @@ while curr < end:
 #     prev = curr
 
 #picam2.stop_encoder()
-np.save("video.npy", np.array(frames))
+np.save("m_video.npy", np.array(m_frames))
+np.save("l_video.npy", np.array(l_frames))
+print(metadata)
