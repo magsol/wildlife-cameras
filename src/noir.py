@@ -34,7 +34,7 @@ def apply_timestamp(request):
 #lsize = (640, 480)
 #hsize = (1920, 1080)
 lsize = (410, 308)
-hsize = (1280, 720)
+hsize = (1640, 1232)
 
 picam2 = Picamera2()
 picam2.pre_callback = apply_timestamp
@@ -53,7 +53,7 @@ encoding = False
 ltime = 0
 curr = time.time()
 # end = curr + (60 * 60 * 8) # Record for 8 hours.
-end = curr + 5 # record for five seconds
+end = curr + 2 # record for five seconds
 
 m_frames = []
 l_frames = []
