@@ -51,8 +51,8 @@ picam2.start_encoder()
 prev_gray = None
 encoding = False
 curr_time = time.time()
-#end_time = curr_time + (60 * 60 * 8) # Record for 8 hours.
-end_time = curr_time + (60 * 10) # Record for 10 minutes.
+end_time = curr_time + (60 * 60 * 8) # Record for 8 hours.
+#end_time = curr_time + (60 * 10) # Record for 10 minutes.
 ltime = 0
 mses = []
 
@@ -73,24 +73,24 @@ while curr_time < end_time:
         # Measure pixels differences between current and
         # previous frame
         mse = np.square(curr_gray - prev_gray).mean()
-        mses.append(mse)
-        if mse > 7:
+        if mse > 3:
             if not encoding:
                 epoch = int(time.time())
+                mses = [mse]
                 encoder.output.fileoutput = f"{epoch}.h264"
                 encoder.output.start()
                 encoding = True
-                print("New Motion", mse)
             ltime = time.time()
+            mses.append(mse)
         else:
             if encoding and time.time() - ltime > 5.0:
                 encoder.output.stop()
                 encoding = False
+                np.save(f"{epoch}.npy", np.array(mses))
     prev_gray = curr_gray
     curr_time = time.time()
 
 picam2.stop_encoder()
-np.save("mse.npy", np.array(mses))
 # np.save("m_video.npy", np.array(m_frames))
 # np.save("l_video.npy", np.array(l_frames))
 # print(metadata)
