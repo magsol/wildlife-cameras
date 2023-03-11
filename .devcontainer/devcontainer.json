@@ -1,0 +1,9 @@
+{
+    // Custom VS Code dev environment for the Raspberry Pi.
+    "name": "Picamera Dev",
+    "build": {
+        // Path is relative to this file.
+        "dockerfile": "Dockerfile"
+    },
+    "runArgs": ["--platform linux/amd64"]
+}
