@@ -73,7 +73,10 @@ for day in range(days):
     curr_time = time.time()
     mses = []
 
-    if curr_time <= sunset and curr_time >= sunrise:
+    # No matter the time of day this kicks off, we're going to sleep until evening
+    # (so this will still start recording immediately if you start it AFTER sunset
+    # but BEFORE midnight).
+    if curr_time <= sunset:
         # Sleep until nighttime.
         print(f"Sleeping for {sunset - curr_time} seconds...")
         time.sleep(sunset - curr_time)
