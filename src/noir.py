@@ -1,5 +1,9 @@
 import time
+from datetime import datetime, timedelta
+import signal
+import os.path as osp
 
+from astral import Location
 import numpy as np
 import cv2
 
@@ -30,7 +34,17 @@ def apply_timestamp(request):
             thickness = thickness
         )
 
+def sig_handler(signum, frame):
+    pass
+
 # Some preliminaries.
+data_dir = '/opt/data'
+signal.signal(signal.SIGINT, sig_handler)
+signal.signal(signal.SIGTERM, sig_handler)
+days = 3
+l = Location(("Athens", "Georgia", 33.9519, -83.3576, "US/Eastern", 0))
+set_offset = timedelta(hours = 1)
+rise_offset = -timedelta(hours = 0.5)
 lsize = (410, 308)
 hsize = (1640, 1232)
 picam2 = Picamera2()
@@ -47,50 +61,52 @@ picam2.encoder = encoder
 picam2.start()
 picam2.start_encoder()
 
-# Loop related variables.
-prev_gray = None
-encoding = False
-curr_time = time.time()
-end_time = curr_time + (60 * 60 * 8) # Record for 8 hours.
-#end_time = curr_time + (60 * 10) # Record for 10 minutes.
-ltime = 0
-mses = []
+# Start the loop.
+for day in range(days):
+    # Loop related variables.
+    sun = l.sun()
+    sunset = (sun["sunset"] + set_offset).timestamp()
+    sunrise = (sun["sunrise"] + timedelta(days = 1) + rise_offset).timestamp()
+    prev_gray = None
+    encoding = False
 
-# while curr_time < end_time:
-#     #frame = picam2.capture_array("lores")
-#     #frame = cv2.cvtColor(frame, cv2.COLOR_YUV420P2GRAY)
-#     #frames.append(frame)
-#     (main, lores), m = picam2.capture_arrays(["main", "lores"])
-#     m_frames.append(main)
-#     l_frames.append(lores)
-#     metadata.append(m)
-#     curr = time.time()
-
-while curr_time < end_time:
-    curr_frame = picam2.capture_array("lores")
-    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_YUV420P2GRAY)
-    if prev_gray is not None:
-        # Measure pixels differences between current and
-        # previous frame
-        mse = np.square(curr_gray - prev_gray).mean()
-        if mse > 3:
-            if not encoding:
-                epoch = int(time.time())
-                mses = [mse]
-                encoder.output.fileoutput = f"{epoch}.h264"
-                encoder.output.start()
-                encoding = True
-            ltime = time.time()
-            mses.append(mse)
-        else:
-            if encoding and time.time() - ltime > 5.0:
-                encoder.output.stop()
-                encoding = False
-                np.save(f"{epoch}.npy", np.array(mses))
-    prev_gray = curr_gray
     curr_time = time.time()
+    mses = []
 
+    if curr_time <= sunset and curr_time >= sunrise:
+        # Sleep until nighttime.
+        print(f"Sleeping for {sunset - curr_time} seconds...")
+        time.sleep(sunset - curr_time)
+        curr_time = time.time()
+    
+    print(f"I'm awake! Let's do day {day + 1}!")
+    while curr_time < sunrise:
+        curr_frame = picam2.capture_array("lores")
+        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_YUV420P2GRAY)
+        if prev_gray is not None:
+            # Measure pixels differences between current and
+            # previous frame
+            mse = np.square(curr_gray - prev_gray).mean()
+            mses.append(mse)
+            if mse > 2:
+                if not encoding:
+                    epoch = int(time.time())
+                    print(f"New motion detected at ts {epoch}!")
+                    encoder.output.fileoutput = osp.join(data_dir, f"{epoch}.h264")
+                    encoder.output.start()
+                    encoding = True
+                ltime = time.time()
+            else:
+                if encoding and time.time() - ltime > 8.0:
+                    encoder.output.stop()
+                    encoding = False
+                    print(f"Motion ended for {epoch}.")
+        prev_gray = curr_gray
+        curr_time = time.time()
+
+    np.save(osp.join(data_dir, f"mse_day{day}.npy"), np.array(mses))
+    print(f"Day {day + 1} is finished.")
+    time.sleep(5) # Just to help things out.
+
+print("THAT'S ALL FOLKS!")
 picam2.stop_encoder()
-# np.save("m_video.npy", np.array(m_frames))
-# np.save("l_video.npy", np.array(l_frames))
-# print(metadata)
