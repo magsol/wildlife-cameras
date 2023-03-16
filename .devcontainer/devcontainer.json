@@ -1,7 +1,15 @@
 {
     // Custom VS Code dev environment for the Raspberry Pi.
     "name": "Picamera2 Development",
-    "image": "ghcr.io/magsol/purah_image:latest"
+    "image": "ghcr.io/magsol/purah_image:latest",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance"
+			]
+        }
+    }
     // "build": {
     //     // Path is relative to this file.
     //     "dockerfile": "Dockerfile"
