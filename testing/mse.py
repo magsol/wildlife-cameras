@@ -11,8 +11,8 @@ from picamera2.outputs import CircularOutput
 # - https://github.com/raspberrypi/picamera2/blob/main/examples/capture_circular.py
 
 # Some preliminaries.
-lsize = (410, 308)
-hsize = (1640, 1232)
+lsize = (1280, 720)
+hsize = (1920, 1080)
 picam2 = Picamera2()
 video_config = picam2.create_video_configuration(
     controls={"FrameDurationLimits": (33333, 33333)},
@@ -53,4 +53,5 @@ for day in range(days):
     np.save(os.path.join(out_dir, f"mse_{day + 2}.npy"), np.array(mses))
     np.save(os.path.join(out_dir, f"ts_{day + 2}.npy"), np.array(tss))
 
+picam2.stop()
 #picam2.stop_encoder()
