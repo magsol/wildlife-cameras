@@ -21,3 +21,19 @@ These are running off a [Raspberry Pi 4 Model B](https://www.raspberrypi.com/pro
    - `apt-get install build-essential python3-libcamera python3-pyqt5 python3-opengl python3-numpy python3-opencv python3-ipython`
 
 The drawback here is that there are essentially two distinct Python environments: the one installed via `apt` which operates the Pi Camera Module, and the one installed over `pip` that operates the Luxonis cameras. Fortunately, we don't really need these two cameras to interact with each other, but it's something to keep in mind moving forward.
+
+## Command line
+
+There are some useful commands that use the underlying `libcamera` library and are good for testing out the camera hardware.
+
+To take a still image and save in `jpg` format:
+
+```bash
+rpicam-jpeg -n -v -o out.jpg
+```
+
+To record a video and save it in H264 format:
+
+```bash
+rpicam-vid -n -v --width 1920 --height 1080 --mode 2304:1296:10 -o out2.h264
+```
