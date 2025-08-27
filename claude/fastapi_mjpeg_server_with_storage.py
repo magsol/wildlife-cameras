@@ -30,7 +30,6 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, validator
-from starlette.staticfiles import StaticFiles
 
 # Import motion storage module
 from motion_storage import initialize as init_motion_storage
