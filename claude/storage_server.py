@@ -1,0 +1,775 @@
+#!/usr/bin/python3
+
+"""
+Remote Storage Server for Motion Detection Videos
+
+This server receives, processes and stores motion detection videos from Raspberry Pi cameras.
+It supports both regular uploads and chunked uploads for large files.
+"""
+
+import asyncio
+import base64
+import datetime
+import json
+import logging
+import os
+import shutil
+import time
+import uuid
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+import uvicorn
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("storage_server")
+
+# Configure storage location
+STORAGE_BASE = os.environ.get("STORAGE_BASE", "/tmp/motion_storage")
+TEMP_UPLOAD_DIR = os.environ.get("TEMP_UPLOAD_DIR", "/tmp/motion_uploads")
+API_KEY = os.environ.get("API_KEY", "your_api_key_here")
+MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE", "104857600"))  # 100MB default
+CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "3600"))  # 1 hour default
+MAX_UPLOAD_AGE = int(os.environ.get("MAX_UPLOAD_AGE", "86400"))  # 1 day default
+
+# Create app
+app = FastAPI(
+    title="Motion Storage Server",
+    description="Server for storing motion detection videos from Raspberry Pi cameras",
+    version="1.0.0"
+)
+
+# Create storage directories if they don't exist
+os.makedirs(STORAGE_BASE, exist_ok=True)
+os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+
+# Models for API
+class StorageStats(BaseModel):
+    total_events: int
+    total_size_mb: float
+    events_by_day: Dict[str, int]
+
+class ChunkedUploadInit(BaseModel):
+    metadata: str
+    file_size: int
+    chunk_size: int
+    total_chunks: int
+    thumbnails: Optional[List[str]] = None
+
+class ChunkedUploadChunk(BaseModel):
+    upload_id: str
+    chunk_index: int
+    chunk_data: str
+
+class ChunkedUploadFinalize(BaseModel):
+    upload_id: str
+
+# Helper function for cleanup
+async def cleanup_old_uploads():
+    """Cleanup old uploads that weren't finalized"""
+    while True:
+        try:
+            if os.path.exists(TEMP_UPLOAD_DIR):
+                now = time.time()
+                for upload_id in os.listdir(TEMP_UPLOAD_DIR):
+                    upload_path = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+                    if os.path.isdir(upload_path):
+                        # Check the age of the directory
+                        mtime = os.path.getmtime(upload_path)
+                        age = now - mtime
+                        
+                        if age > MAX_UPLOAD_AGE:
+                            logger.info(f"Removing old upload: {upload_id}, age: {age/3600:.1f} hours")
+                            shutil.rmtree(upload_path, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}")
+            
+        await asyncio.sleep(CLEANUP_INTERVAL)
+
+# Start cleanup task
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(cleanup_old_uploads())
+
+# Single Upload Endpoint
+@app.post("/storage")
+async def store_motion_event(
+    video: UploadFile = File(...),
+    metadata: str = Form(...),
+    x_api_key: str = Header(None)
+):
+    """Store a motion event video and metadata"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+        
+    try:
+        # Parse metadata
+        meta_data = json.loads(metadata)
+        event_id = meta_data.get("id")
+        
+        if not event_id:
+            raise HTTPException(status_code=400, detail="Invalid metadata: missing id")
+            
+        # Check file size
+        video_content = await video.read()
+        if len(video_content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large: {len(video_content)} bytes, max: {MAX_UPLOAD_SIZE} bytes"
+            )
+            
+        # Create directory structure: YYYY/MM/DD/event_id
+        start_time = datetime.datetime.fromisoformat(meta_data.get("start_time"))
+        year_dir = start_time.strftime("%Y")
+        month_dir = start_time.strftime("%m")
+        day_dir = start_time.strftime("%d")
+        
+        event_path = os.path.join(STORAGE_BASE, year_dir, month_dir, day_dir, event_id)
+        os.makedirs(event_path, exist_ok=True)
+        
+        # Save video file
+        video_path = os.path.join(event_path, "motion.mp4")
+        with open(video_path, "wb") as f:
+            f.write(video_content)
+            
+        # Save thumbnails if provided
+        for i in range(10):  # Check for up to 10 thumbnails
+            thumbnail_key = f'thumbnail_{i}'
+            if thumbnail_key in form:
+                thumbnail = form[thumbnail_key]
+                thumbnails_dir = os.path.join(event_path, "thumbnails")
+                os.makedirs(thumbnails_dir, exist_ok=True)
+                
+                thumb_path = os.path.join(thumbnails_dir, f"thumb_{i}.jpg")
+                thumb_content = await thumbnail.read()
+                with open(thumb_path, "wb") as f:
+                    f.write(thumb_content)
+            
+        # Save metadata
+        meta_data["uploaded_time"] = datetime.datetime.now().isoformat()
+        meta_path = os.path.join(event_path, "metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta_data, f, indent=2)
+            
+        return {
+            "success": True,
+            "event_id": event_id,
+            "file_size": len(video_content)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error storing motion event: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
+# Chunked Upload Endpoints
+@app.post("/storage/chunked/init")
+async def init_chunked_upload(request: Request):
+    """Initialize a chunked upload"""
+    # Verify API key
+    api_key = request.headers.get("X-API-Key")
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+        
+    try:
+        # Get request data
+        data = await request.json()
+        metadata_str = data.get("metadata", "{}")
+        file_size = int(data.get("file_size", 0))
+        chunk_size = int(data.get("chunk_size", 1024 * 1024))  # Default 1MB
+        total_chunks = int(data.get("total_chunks", 0))
+        thumbnails = data.get("thumbnails", [])
+        
+        # Validate data
+        if file_size <= 0 or total_chunks <= 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid file_size or total_chunks"
+            )
+            
+        # Check if file size is too large
+        if file_size > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large: {file_size} bytes, max: {MAX_UPLOAD_SIZE} bytes"
+            )
+            
+        # Parse metadata
+        metadata = json.loads(metadata_str)
+        
+        # Generate upload ID
+        upload_id = f"upload_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        
+        # Create temp directory for chunks
+        upload_dir = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Save metadata
+        with open(os.path.join(upload_dir, "metadata.json"), "w") as f:
+            json.dump({
+                "metadata": metadata,
+                "file_size": file_size,
+                "chunk_size": chunk_size,
+                "total_chunks": total_chunks,
+                "received_chunks": 0,
+                "start_time": datetime.datetime.now().isoformat()
+            }, f, indent=2)
+        
+        # Save thumbnails
+        if thumbnails:
+            thumbnails_dir = os.path.join(upload_dir, "thumbnails")
+            os.makedirs(thumbnails_dir, exist_ok=True)
+            
+            for i, thumb_data in enumerate(thumbnails):
+                try:
+                    thumb_bytes = base64.b64decode(thumb_data)
+                    with open(os.path.join(thumbnails_dir, f"thumb_{i}.jpg"), "wb") as f:
+                        f.write(thumb_bytes)
+                except Exception as e:
+                    logger.error(f"Error saving thumbnail {i}: {e}")
+        
+        logger.info(f"Initialized chunked upload {upload_id}, total size: {file_size/1024/1024:.2f} MB, " 
+                   f"chunks: {total_chunks}")
+        
+        return {"upload_id": upload_id}
+        
+    except Exception as e:
+        logger.error(f"Error initializing chunked upload: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/storage/chunked/upload")
+async def upload_chunk(request: Request):
+    """Upload a chunk of data for a chunked upload"""
+    # Verify API key
+    api_key = request.headers.get("X-API-Key")
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+        
+    try:
+        # Get request data
+        data = await request.json()
+        upload_id = data.get("upload_id")
+        chunk_index = int(data.get("chunk_index", 0))
+        chunk_data = data.get("chunk_data", "")
+        
+        if not upload_id or not chunk_data:
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing upload_id or chunk_data"
+            )
+        
+        # Check if upload exists
+        upload_dir = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+        if not os.path.exists(upload_dir):
+            raise HTTPException(status_code=404, detail="Upload not found")
+        
+        # Decode chunk data
+        try:
+            decoded_data = base64.b64decode(chunk_data)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid base64 data: {str(e)}"
+            )
+        
+        # Save chunk
+        chunks_dir = os.path.join(upload_dir, "chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
+        
+        chunk_file = os.path.join(chunks_dir, f"{chunk_index:06d}")
+        with open(chunk_file, "wb") as f:
+            f.write(decoded_data)
+        
+        # Update metadata
+        metadata_file = os.path.join(upload_dir, "metadata.json")
+        with open(metadata_file, "r") as f:
+            metadata = json.load(f)
+        
+        # Increment received chunks
+        metadata["received_chunks"] = metadata.get("received_chunks", 0) + 1
+        
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f, indent=2)
+            
+        logger.debug(f"Received chunk {chunk_index} for upload {upload_id}, "
+                    f"size: {len(decoded_data)/1024:.2f} KB, "
+                    f"{metadata['received_chunks']}/{metadata['total_chunks']} chunks")
+        
+        return {"success": True, "chunk_index": chunk_index}
+        
+    except Exception as e:
+        logger.error(f"Error uploading chunk: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/storage/chunked/finalize")
+async def finalize_upload(request: Request):
+    """Finalize a chunked upload"""
+    # Verify API key
+    api_key = request.headers.get("X-API-Key")
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+        
+    try:
+        # Get request data
+        data = await request.json()
+        upload_id = data.get("upload_id")
+        
+        if not upload_id:
+            raise HTTPException(status_code=400, detail="Missing upload_id")
+        
+        # Check if upload exists
+        upload_dir = os.path.join(TEMP_UPLOAD_DIR, upload_id)
+        if not os.path.exists(upload_dir):
+            raise HTTPException(status_code=404, detail="Upload not found")
+        
+        # Load metadata
+        with open(os.path.join(upload_dir, "metadata.json"), "r") as f:
+            metadata = json.load(f)
+            
+        original_metadata = metadata.get("metadata", {})
+        event_id = original_metadata.get("id", f"event_{int(time.time())}")
+        total_chunks = metadata.get("total_chunks", 0)
+        received_chunks = metadata.get("received_chunks", 0)
+        file_size = metadata.get("file_size", 0)
+        
+        # Check if all chunks were received
+        if received_chunks < total_chunks:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Not all chunks received: {received_chunks}/{total_chunks}"
+            )
+            
+        # Create final directory structure: YYYY/MM/DD/event_id
+        start_time_str = original_metadata.get("start_time")
+        if start_time_str:
+            start_time = datetime.datetime.fromisoformat(start_time_str)
+        else:
+            start_time = datetime.datetime.now()
+        
+        year_dir = start_time.strftime("%Y")
+        month_dir = start_time.strftime("%m")
+        day_dir = start_time.strftime("%d")
+        
+        event_path = os.path.join(STORAGE_BASE, year_dir, month_dir, day_dir, event_id)
+        os.makedirs(event_path, exist_ok=True)
+        
+        # Combine chunks into final video file
+        chunks_dir = os.path.join(upload_dir, "chunks")
+        video_path = os.path.join(event_path, "motion.mp4")
+        
+        with open(video_path, "wb") as outfile:
+            for i in range(total_chunks):
+                chunk_file = os.path.join(chunks_dir, f"{i:06d}")
+                if os.path.exists(chunk_file):
+                    with open(chunk_file, "rb") as infile:
+                        outfile.write(infile.read())
+                else:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Missing chunk {i}"
+                    )
+        
+        # Copy thumbnails if they exist
+        thumbnails_dir = os.path.join(upload_dir, "thumbnails")
+        if os.path.exists(thumbnails_dir):
+            target_thumbnails_dir = os.path.join(event_path, "thumbnails")
+            os.makedirs(target_thumbnails_dir, exist_ok=True)
+            
+            for thumb_file in os.listdir(thumbnails_dir):
+                if thumb_file.endswith('.jpg'):
+                    shutil.copy(
+                        os.path.join(thumbnails_dir, thumb_file),
+                        os.path.join(target_thumbnails_dir, thumb_file)
+                    )
+        
+        # Save metadata
+        original_metadata["uploaded_time"] = datetime.datetime.now().isoformat()
+        with open(os.path.join(event_path, "metadata.json"), "w") as f:
+            json.dump(original_metadata, f, indent=2)
+            
+        # Clean up temporary upload directory
+        shutil.rmtree(upload_dir)
+        
+        actual_size = os.path.getsize(video_path)
+        logger.info(f"Finalized upload {upload_id} as event {event_id}, "
+                   f"size: {actual_size/1024/1024:.2f} MB")
+        
+        return {
+            "success": True,
+            "event_id": event_id,
+            "path": event_path,
+            "file_size": actual_size
+        }
+        
+    except Exception as e:
+        logger.error(f"Error finalizing upload: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Management Endpoints
+@app.get("/storage/stats")
+async def get_storage_stats(x_api_key: str = Header(None)):
+    """Get storage statistics"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    try:
+        total_size = 0
+        total_events = 0
+        events_by_day = {}
+        
+        # Walk through the storage directory
+        for year in os.listdir(STORAGE_BASE):
+            year_path = os.path.join(STORAGE_BASE, year)
+            if not os.path.isdir(year_path):
+                continue
+                
+            for month in os.listdir(year_path):
+                month_path = os.path.join(year_path, month)
+                if not os.path.isdir(month_path):
+                    continue
+                    
+                for day in os.listdir(month_path):
+                    day_path = os.path.join(month_path, day)
+                    if not os.path.isdir(day_path):
+                        continue
+                        
+                    # Count events for this day
+                    day_key = f"{year}-{month}-{day}"
+                    day_events = 0
+                    day_size = 0
+                    
+                    for event_id in os.listdir(day_path):
+                        event_path = os.path.join(day_path, event_id)
+                        if not os.path.isdir(event_path):
+                            continue
+                            
+                        # Count this as an event
+                        total_events += 1
+                        day_events += 1
+                        
+                        # Add up size of all files in event directory
+                        for root, dirs, files in os.walk(event_path):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                file_size = os.path.getsize(file_path)
+                                total_size += file_size
+                                day_size += file_size
+                                
+                    # Add to events by day
+                    events_by_day[day_key] = {
+                        "events": day_events,
+                        "size_mb": round(day_size / (1024 * 1024), 2)
+                    }
+        
+        return {
+            "total_events": total_events,
+            "total_size_mb": round(total_size / (1024 * 1024), 2),
+            "events_by_day": events_by_day
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting storage stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/storage/events")
+async def list_events(
+    date: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    x_api_key: str = Header(None)
+):
+    """List events, optionally filtered by date (YYYY-MM-DD)"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    try:
+        events = []
+        
+        # Parse date filter if provided
+        year = None
+        month = None
+        day = None
+        
+        if date:
+            parts = date.split("-")
+            if len(parts) >= 1:
+                year = parts[0]
+            if len(parts) >= 2:
+                month = parts[1]
+            if len(parts) >= 3:
+                day = parts[2]
+        
+        # Walk through storage directory
+        base_path = Path(STORAGE_BASE)
+        
+        # Apply filters
+        year_dirs = [year] if year else os.listdir(STORAGE_BASE)
+        
+        for year_dir in year_dirs:
+            year_path = base_path / year_dir
+            if not year_path.is_dir():
+                continue
+                
+            month_dirs = [month] if month else os.listdir(year_path)
+            
+            for month_dir in month_dirs:
+                month_path = year_path / month_dir
+                if not month_path.is_dir():
+                    continue
+                    
+                day_dirs = [day] if day else os.listdir(month_path)
+                
+                for day_dir in day_dirs:
+                    day_path = month_path / day_dir
+                    if not day_path.is_dir():
+                        continue
+                        
+                    # Process events for this day
+                    for event_id in os.listdir(day_path):
+                        event_path = day_path / event_id
+                        if not event_path.is_dir():
+                            continue
+                            
+                        # Get metadata
+                        metadata_path = event_path / "metadata.json"
+                        if metadata_path.exists():
+                            with open(metadata_path, "r") as f:
+                                metadata = json.load(f)
+                                
+                            # Add path information
+                            metadata["path"] = str(event_path)
+                            
+                            # Check for video and thumbnails
+                            video_path = event_path / "motion.mp4"
+                            metadata["video_exists"] = video_path.exists()
+                            if video_path.exists():
+                                metadata["video_size_mb"] = round(video_path.stat().st_size / (1024 * 1024), 2)
+                                
+                            thumbnails_dir = event_path / "thumbnails"
+                            metadata["has_thumbnails"] = thumbnails_dir.exists()
+                            if thumbnails_dir.exists():
+                                metadata["thumbnail_count"] = len([f for f in os.listdir(thumbnails_dir) if f.endswith('.jpg')])
+                            
+                            events.append(metadata)
+        
+        # Sort events by start_time (newest first)
+        events.sort(key=lambda e: e.get("start_time", ""), reverse=True)
+        
+        # Apply limit and offset
+        paged_events = events[offset:offset+limit]
+        
+        return {
+            "events": paged_events,
+            "total": len(events),
+            "limit": limit,
+            "offset": offset
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing events: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/storage/events/{event_id}")
+async def get_event(event_id: str, x_api_key: str = Header(None)):
+    """Get details of a specific event"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    try:
+        # Find event in storage
+        event_path = None
+        for root, dirs, files in os.walk(STORAGE_BASE):
+            for dir_name in dirs:
+                if dir_name == event_id:
+                    event_path = os.path.join(root, dir_name)
+                    break
+            if event_path:
+                break
+                
+        if not event_path:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+            
+        # Get metadata
+        metadata_path = os.path.join(event_path, "metadata.json")
+        if not os.path.exists(metadata_path):
+            raise HTTPException(status_code=404, detail=f"Metadata for event {event_id} not found")
+            
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+            
+        # Add additional information
+        metadata["path"] = event_path
+        
+        # Check for video
+        video_path = os.path.join(event_path, "motion.mp4")
+        metadata["video_exists"] = os.path.exists(video_path)
+        if os.path.exists(video_path):
+            metadata["video_size_mb"] = round(os.path.getsize(video_path) / (1024 * 1024), 2)
+            
+        # Check for thumbnails
+        thumbnails_dir = os.path.join(event_path, "thumbnails")
+        metadata["has_thumbnails"] = os.path.exists(thumbnails_dir)
+        if os.path.exists(thumbnails_dir):
+            thumbnails = [f for f in os.listdir(thumbnails_dir) if f.endswith('.jpg')]
+            metadata["thumbnail_count"] = len(thumbnails)
+            
+            # Add thumbnail URLs
+            thumbnail_urls = []
+            for thumb in thumbnails:
+                thumbnail_urls.append(f"/storage/events/{event_id}/thumbnails/{thumb}")
+            metadata["thumbnail_urls"] = thumbnail_urls
+            
+        return metadata
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting event {event_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/storage/events/{event_id}/video")
+async def get_event_video(event_id: str, x_api_key: str = Header(None)):
+    """Get video file for a specific event"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    try:
+        # Find event in storage
+        event_path = None
+        for root, dirs, files in os.walk(STORAGE_BASE):
+            for dir_name in dirs:
+                if dir_name == event_id:
+                    event_path = os.path.join(root, dir_name)
+                    break
+            if event_path:
+                break
+                
+        if not event_path:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+            
+        # Check for video
+        video_path = os.path.join(event_path, "motion.mp4")
+        if not os.path.exists(video_path):
+            raise HTTPException(status_code=404, detail=f"Video for event {event_id} not found")
+            
+        return FileResponse(
+            video_path,
+            media_type="video/mp4",
+            filename=f"{event_id}.mp4"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting video for event {event_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/storage/events/{event_id}/thumbnails/{thumb_file}")
+async def get_event_thumbnail(
+    event_id: str,
+    thumb_file: str,
+    x_api_key: str = Header(None)
+):
+    """Get a thumbnail for a specific event"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    try:
+        # Find event in storage
+        event_path = None
+        for root, dirs, files in os.walk(STORAGE_BASE):
+            for dir_name in dirs:
+                if dir_name == event_id:
+                    event_path = os.path.join(root, dir_name)
+                    break
+            if event_path:
+                break
+                
+        if not event_path:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+            
+        # Check for thumbnail
+        thumbnails_dir = os.path.join(event_path, "thumbnails")
+        if not os.path.exists(thumbnails_dir):
+            raise HTTPException(status_code=404, detail=f"Thumbnails for event {event_id} not found")
+            
+        thumb_path = os.path.join(thumbnails_dir, thumb_file)
+        if not os.path.exists(thumb_path) or not thumb_file.endswith('.jpg'):
+            raise HTTPException(status_code=404, detail=f"Thumbnail {thumb_file} not found")
+            
+        return FileResponse(
+            thumb_path,
+            media_type="image/jpeg"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting thumbnail for event {event_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/storage/events/{event_id}")
+async def delete_event(event_id: str, x_api_key: str = Header(None)):
+    """Delete a specific event"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    try:
+        # Find event in storage
+        event_path = None
+        for root, dirs, files in os.walk(STORAGE_BASE):
+            for dir_name in dirs:
+                if dir_name == event_id:
+                    event_path = os.path.join(root, dir_name)
+                    break
+            if event_path:
+                break
+                
+        if not event_path:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+            
+        # Delete event directory
+        shutil.rmtree(event_path)
+        
+        return {"success": True, "message": f"Event {event_id} deleted"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting event {event_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Server info endpoint
+@app.get("/")
+async def get_server_info():
+    return {
+        "name": "Motion Storage Server",
+        "version": "1.0.0",
+        "storage_path": STORAGE_BASE,
+        "max_upload_size_mb": MAX_UPLOAD_SIZE / (1024 * 1024)
+    }
+
+# Mount a simple web UI (optional - can be added later)
+# app.mount("/ui", StaticFiles(directory="static", html=True), name="ui")
+
+if __name__ == "__main__":
+    # Run server
+    uvicorn.run(app, host="0.0.0.0", port=8080)

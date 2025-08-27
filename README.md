@@ -18,7 +18,7 @@ These are running off a [Raspberry Pi 4 Model B](https://www.raspberrypi.com/pro
 
  - DepthAI [install instructions](https://docs.luxonis.com/projects/api/en/latest/install/#raspberry-pi-os) for Raspberry Pi OS (in practice, this ends up using system tools, and so all it needs is basic Python + pip)
  - [PiCamera2](https://github.com/raspberrypi/picamera2)
-   - `apt-get install build-essential python3-libcamera python3-pyqt5 python3-opengl python3-numpy python3-opencv python3-ipython`
+   - `apt-get install build-essential python3-libcamera python3-pyqt5 python3-opengl python3-numpy python3-opencv python3-ipython python3-astral`
 
 The drawback here is that there are essentially two distinct Python environments: the one installed via `apt` which operates the Pi Camera Module, and the one installed over `pip` that operates the Luxonis cameras. Fortunately, we don't really need these two cameras to interact with each other, but it's something to keep in mind moving forward.
 
