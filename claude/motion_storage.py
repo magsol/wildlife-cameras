@@ -30,8 +30,32 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Set
 
+# Helper function to detect Raspberry Pi
+def is_raspberry_pi():
+    """Detect if running on a Raspberry Pi using multiple methods"""
+    # Method 1: Check for Pi-specific file locations
+    if os.path.exists("/opt/vc/bin/raspivid") or os.path.exists("/usr/bin/vcgencmd"):
+        return True
+        
+    # Method 2: Check CPU info
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            cpuinfo = f.read()
+            if "BCM" in cpuinfo or "Raspberry Pi" in cpuinfo:
+                return True
+    except Exception:
+        pass
+        
+    # Method 3: Check for Pi-specific environment variables
+    if "RASPBERRY_PI" in os.environ:
+        return True
+        
+    # Default to false if no indicators found
+    return False
+
 # Constants for WiFi signal strength monitoring
-WIFI_AVAILABLE = True  # Assume WiFi is available on Raspberry Pi
+WIFI_AVAILABLE = True  # Will be updated based on platform check
+IS_RASPBERRY_PI = is_raspberry_pi()  # Determine if we're running on a Raspberry Pi
 
 # Constants
 MIN_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
@@ -46,6 +70,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger("motion_storage")
+
+# Motion detection variables - initialized here for module scope
+prev_frame = None
+motion_detected = False
+motion_regions = []
 
 # Storage configuration
 @dataclass
@@ -257,12 +286,14 @@ class MotionEventRecorder:
         # Try to use hardware encoding if available
         try:
             # Check if we're on Raspberry Pi and use hardware encoding
-            if os.path.exists("/opt/vc/bin/raspivid"):
+            if IS_RASPBERRY_PI:
                 # Use H.264 hardware encoding via ffmpeg
                 fourcc = cv2.VideoWriter_fourcc(*'H264')
+                logger.debug("Using hardware H.264 encoding on Raspberry Pi")
             else:
                 # Fallback to standard encoding
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                logger.debug("Using standard mp4v encoding (non-Raspberry Pi device)")
                 
             # Create video writer
             out = cv2.VideoWriter(output_path, fourcc, 30.0, (width, height))
@@ -275,7 +306,8 @@ class MotionEventRecorder:
             out.release()
             
             # For Raspberry Pi, we might need to convert the raw H.264 to MP4
-            if os.path.exists("/opt/vc/bin/raspivid") and output_path.endswith('.h264'):
+            if IS_RASPBERRY_PI and output_path.endswith('.h264'):
+                logger.debug("Converting raw H.264 to MP4 format")
                 mp4_output = output_path.replace('.h264', '.mp4')
                 cmd = ["ffmpeg", "-i", output_path, "-c:v", "copy", mp4_output]
                 subprocess.run(cmd, check=True)
@@ -335,23 +367,35 @@ class WiFiMonitor:
         self.config = config
         self.current_signal = None
         self.current_throttle = config.upload_throttle_kbps
-        self.enabled = config.wifi_monitoring and WIFI_AVAILABLE
         
+        # Update WiFi availability based on platform
+        global WIFI_AVAILABLE
+        if not IS_RASPBERRY_PI:
+            logger.info("Non-Raspberry Pi platform detected, disabling WiFi monitoring")
+            WIFI_AVAILABLE = False
+            
+        self.enabled = config.wifi_monitoring and WIFI_AVAILABLE
         self.lock = threading.Lock()
         
         if self.enabled:
             # Check if the WiFi adapter exists
             try:
-                subprocess.check_output(["iwconfig", config.wifi_adapter], stderr=subprocess.STDOUT)
-                self.monitor_thread = threading.Thread(target=self._monitor_signal)
-                self.monitor_thread.daemon = True
-                self.monitor_thread.start()
-                logger.info(f"WiFi signal monitoring enabled for adapter {config.wifi_adapter}")
+                # First check if iwconfig exists
+                if shutil.which("iwconfig") is None:
+                    logger.warning("iwconfig command not found, disabling WiFi monitoring")
+                    self.enabled = False
+                else:
+                    # Check if adapter exists
+                    subprocess.check_output(["iwconfig", config.wifi_adapter], stderr=subprocess.STDOUT)
+                    self.monitor_thread = threading.Thread(target=self._monitor_signal)
+                    self.monitor_thread.daemon = True
+                    self.monitor_thread.start()
+                    logger.info(f"WiFi signal monitoring enabled for adapter {config.wifi_adapter}")
             except (subprocess.SubprocessError, FileNotFoundError):
                 logger.warning(f"WiFi adapter {config.wifi_adapter} not found or iwconfig not available")
                 self.enabled = False
         else:
-            logger.info("WiFi monitoring disabled in configuration")
+            logger.info("WiFi monitoring disabled in configuration or not supported on this platform")
     
     def get_current_throttle(self):
         """Get the current throttle value based on WiFi signal strength"""
@@ -638,19 +682,32 @@ class TransferManager:
         event_dir = os.path.join(self.config.local_storage_path, event_id)
         metadata_path = os.path.join(event_dir, "metadata.json")
         video_path = os.path.join(event_dir, "motion.mp4")
+        upload_id = None  # Track upload ID for cleanup
         
-        if not os.path.exists(metadata_path) or not os.path.exists(video_path):
-            logger.error(f"Event files missing for {event_id}")
+        # Validate files exist
+        if not os.path.exists(metadata_path):
+            logger.error(f"Metadata file missing for {event_id}")
+            return False
+            
+        if not os.path.exists(video_path):
+            logger.error(f"Video file missing for {event_id}")
             return False
             
         try:
             # Load metadata
             with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
+                try:
+                    metadata = json.load(f)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid metadata JSON for {event_id}: {e}")
+                    return False
                 
             # Get file size
             video_size = os.path.getsize(video_path)
-            
+            if video_size == 0:
+                logger.error(f"Empty video file for {event_id}")
+                return False
+                
             # Determine chunk size based on file size
             chunk_size = min(MAX_UPLOAD_CHUNK_SIZE, max(MIN_UPLOAD_CHUNK_SIZE, video_size // 10))
             
@@ -674,101 +731,175 @@ class TransferManager:
                 for thumb_file in os.listdir(thumbnails_dir):
                     if thumb_file.endswith('.jpg'):
                         thumb_path = os.path.join(thumbnails_dir, thumb_file)
-                        with open(thumb_path, 'rb') as f:
-                            thumb_data = f.read()
-                            thumbnails.append(base64.b64encode(thumb_data).decode('utf-8'))
+                        try:
+                            with open(thumb_path, 'rb') as f:
+                                thumb_data = f.read()
+                                thumbnails.append(base64.b64encode(thumb_data).decode('utf-8'))
+                        except Exception as e:
+                            logger.warning(f"Failed to read thumbnail {thumb_file} for {event_id}: {e}")
+                            # Continue without this thumbnail
             
             if thumbnails:
                 init_data['thumbnails'] = thumbnails
                 
             logger.info(f"Initializing chunked upload for event {event_id} "
                       f"({video_size / 1024 / 1024:.2f} MB, {init_data['total_chunks']} chunks)")
-                
-            response = requests.post(
-                f"{self.config.remote_storage_url}/chunked/init",
-                json=init_data,
-                headers={'X-API-Key': self.config.remote_api_key}
-            )
             
-            if response.status_code != 200:
-                logger.error(f"Failed to initialize chunked upload for {event_id}: "
-                           f"{response.text}")
-                return False
-                
-            # Get upload ID
-            upload_id = response.json().get('upload_id')
-            if not upload_id:
-                logger.error(f"No upload ID received for {event_id}")
+            # Initialize upload with retry logic
+            init_retry_count = 0
+            init_success = False
+            
+            while init_retry_count < MAX_RETRIES and not init_success:
+                try:
+                    response = requests.post(
+                        f"{self.config.remote_storage_url}/chunked/init",
+                        json=init_data,
+                        headers={'X-API-Key': self.config.remote_api_key},
+                        timeout=30  # Add timeout to prevent hanging
+                    )
+                    
+                    if response.status_code == 200:
+                        init_success = True
+                        # Get upload ID
+                        upload_id = response.json().get('upload_id')
+                        if not upload_id:
+                            logger.error(f"No upload ID received for {event_id}")
+                            return False
+                    else:
+                        init_retry_count += 1
+                        logger.warning(f"Failed to initialize upload for {event_id} (attempt {init_retry_count}/{MAX_RETRIES}): {response.text}")
+                        if init_retry_count < MAX_RETRIES:
+                            time.sleep(2 ** init_retry_count)  # Exponential backoff
+                            
+                except (requests.RequestException, IOError) as e:
+                    init_retry_count += 1
+                    logger.warning(f"Network error initializing upload for {event_id} (attempt {init_retry_count}/{MAX_RETRIES}): {e}")
+                    if init_retry_count < MAX_RETRIES:
+                        time.sleep(2 ** init_retry_count)  # Exponential backoff
+            
+            if not init_success:
+                logger.error(f"Failed to initialize upload for {event_id} after {MAX_RETRIES} attempts")
                 return False
                 
             # Upload chunks
-            with open(video_path, 'rb') as f:
-                chunk_index = 0
-                retries = 0
-                
-                while True:
-                    # Read chunk
-                    chunk_data = f.read(chunk_size)
-                    if not chunk_data:
-                        break
-                        
-                    # Check if we should throttle uploads
-                    if throttle_kbps > 0:
-                        # Calculate delay based on chunk size and throttle
-                        delay = (len(chunk_data) * 8) / (throttle_kbps * 1000)
-                        time.sleep(delay)
-                        
-                    # Upload chunk
-                    chunk_b64 = base64.b64encode(chunk_data).decode('utf-8')
+            try:
+                with open(video_path, 'rb') as f:
+                    chunk_index = 0
+                    retries = 0
+                    total_chunks = init_data['total_chunks']
                     
-                    chunk_response = requests.post(
-                        f"{self.config.remote_storage_url}/chunked/upload",
-                        json={
-                            'upload_id': upload_id,
-                            'chunk_index': chunk_index,
-                            'chunk_data': chunk_b64
-                        },
-                        headers={'X-API-Key': self.config.remote_api_key}
-                    )
-                    
-                    if chunk_response.status_code != 200:
-                        retries += 1
-                        logger.warning(f"Failed to upload chunk {chunk_index} for {event_id}: "
-                                     f"{chunk_response.text}, retry {retries}/{MAX_RETRIES}")
-                        
-                        if retries >= MAX_RETRIES:
-                            logger.error(f"Max retries reached for chunk {chunk_index}")
-                            return False
+                    while True:
+                        # Read chunk
+                        chunk_data = f.read(chunk_size)
+                        if not chunk_data:
+                            break
                             
-                        # Wait before retrying
-                        time.sleep(2 ** retries)  # Exponential backoff
+                        # Check if we should throttle uploads
+                        if throttle_kbps > 0:
+                            # Calculate delay based on chunk size and throttle
+                            delay = (len(chunk_data) * 8) / (throttle_kbps * 1000)
+                            time.sleep(delay)
+                            
+                        # Upload chunk
+                        chunk_b64 = base64.b64encode(chunk_data).decode('utf-8')
                         
-                        # Seek back to start of this chunk
-                        f.seek(chunk_index * chunk_size)
-                    else:
-                        # Reset retry counter and move to next chunk
-                        retries = 0
-                        chunk_index += 1
-                        logger.debug(f"Uploaded chunk {chunk_index}/{init_data['total_chunks']} "
-                                   f"for {event_id}")
+                        upload_success = False
+                        chunk_retry_count = 0
                         
-            # Finalize upload
-            finalize_response = requests.post(
-                f"{self.config.remote_storage_url}/chunked/finalize",
-                json={'upload_id': upload_id},
-                headers={'X-API-Key': self.config.remote_api_key}
-            )
+                        while not upload_success and chunk_retry_count < MAX_RETRIES:
+                            try:
+                                chunk_response = requests.post(
+                                    f"{self.config.remote_storage_url}/chunked/upload",
+                                    json={
+                                        'upload_id': upload_id,
+                                        'chunk_index': chunk_index,
+                                        'chunk_data': chunk_b64
+                                    },
+                                    headers={'X-API-Key': self.config.remote_api_key},
+                                    timeout=60  # Add timeout for large chunks
+                                )
+                                
+                                if chunk_response.status_code == 200:
+                                    upload_success = True
+                                    chunk_index += 1
+                                    logger.debug(f"Uploaded chunk {chunk_index}/{total_chunks} "
+                                               f"for {event_id}")
+                                else:
+                                    chunk_retry_count += 1
+                                    logger.warning(f"Failed to upload chunk {chunk_index} for {event_id} "
+                                                f"(attempt {chunk_retry_count}/{MAX_RETRIES}): "
+                                                f"{chunk_response.text}")
+                                    if chunk_retry_count < MAX_RETRIES:
+                                        time.sleep(2 ** chunk_retry_count)  # Exponential backoff
+                            
+                            except (requests.RequestException, IOError) as e:
+                                chunk_retry_count += 1
+                                logger.warning(f"Network error uploading chunk {chunk_index} for {event_id} "
+                                            f"(attempt {chunk_retry_count}/{MAX_RETRIES}): {e}")
+                                if chunk_retry_count < MAX_RETRIES:
+                                    time.sleep(2 ** chunk_retry_count)  # Exponential backoff
+                        
+                        if not upload_success:
+                            logger.error(f"Failed to upload chunk {chunk_index} for {event_id} after {MAX_RETRIES} attempts")
+                            return False
             
-            if finalize_response.status_code != 200:
-                logger.error(f"Failed to finalize upload for {event_id}: "
-                           f"{finalize_response.text}")
+                    # All chunks uploaded successfully, now finalize
+                    finalize_success = False
+                    finalize_retry_count = 0
+                    
+                    while not finalize_success and finalize_retry_count < MAX_RETRIES:
+                        try:
+                            finalize_response = requests.post(
+                                f"{self.config.remote_storage_url}/chunked/finalize",
+                                json={'upload_id': upload_id},
+                                headers={'X-API-Key': self.config.remote_api_key},
+                                timeout=30
+                            )
+                            
+                            if finalize_response.status_code == 200:
+                                finalize_success = True
+                                logger.info(f"Successfully uploaded event {event_id} in {chunk_index} chunks")
+                                return True
+                            else:
+                                finalize_retry_count += 1
+                                logger.warning(f"Failed to finalize upload for {event_id} "
+                                            f"(attempt {finalize_retry_count}/{MAX_RETRIES}): "
+                                            f"{finalize_response.text}")
+                                if finalize_retry_count < MAX_RETRIES:
+                                    time.sleep(2 ** finalize_retry_count)  # Exponential backoff
+                        
+                        except (requests.RequestException, IOError) as e:
+                            finalize_retry_count += 1
+                            logger.warning(f"Network error finalizing upload for {event_id} "
+                                        f"(attempt {finalize_retry_count}/{MAX_RETRIES}): {e}")
+                            if finalize_retry_count < MAX_RETRIES:
+                                time.sleep(2 ** finalize_retry_count)  # Exponential backoff
+                    
+                    if not finalize_success:
+                        logger.error(f"Failed to finalize upload for {event_id} after {MAX_RETRIES} attempts")
+                        return False
+                    
+            except IOError as e:
+                logger.error(f"File I/O error during chunked upload for {event_id}: {e}")
                 return False
                 
-            logger.info(f"Successfully uploaded event {event_id} in {chunk_index} chunks")
-            return True
-                
         except Exception as e:
-            logger.error(f"Error in chunked upload for event {event_id}: {e}")
+            logger.error(f"Error in chunked upload for {event_id}: {e}")
+            
+            # Try to clean up remote upload if it was initialized but failed
+            if upload_id:
+                try:
+                    # Best effort to cancel the upload
+                    requests.post(
+                        f"{self.config.remote_storage_url}/chunked/cancel",
+                        json={'upload_id': upload_id},
+                        headers={'X-API-Key': self.config.remote_api_key},
+                        timeout=10
+                    )
+                    logger.info(f"Sent cancellation request for upload {upload_id}")
+                except Exception as cancel_err:
+                    logger.warning(f"Failed to cancel upload {upload_id}: {cancel_err}")
+                    
             return False
             
     def _cleanup_event(self, event_id):
