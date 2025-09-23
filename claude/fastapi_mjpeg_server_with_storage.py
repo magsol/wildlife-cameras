@@ -85,8 +85,9 @@ motion_regions = []
 motion_history = []  # List of (timestamp, region) tuples
 
 # Frame buffer with thread-safe access
-class FrameBuffer:
+class FrameBuffer(io.BufferedIOBase):
     def __init__(self, max_size: int = 5):
+        super().__init__()
         self.frame = None
         self.condition = Condition()
         self.last_access_times: Dict[str, float] = {}
@@ -163,7 +164,20 @@ class FrameBuffer:
         """Unregister a client"""
         with self.condition:
             if client_id in self.last_access_times:
-                del self.last_access_times[cid]
+                del self.last_access_times[client_id]
+                
+    # Required methods to implement BufferedIOBase interface
+    def readable(self):
+        return False
+        
+    def writable(self):
+        return True
+        
+    def seekable(self):
+        return False
+        
+    def flush(self):
+        pass
 
 # Initialize the frame buffer
 frame_buffer = FrameBuffer()
