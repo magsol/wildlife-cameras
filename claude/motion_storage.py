@@ -1185,8 +1185,18 @@ def integrate_with_fastapi_server(app, camera_config):
         transfer_manager.check_disk_usage()
         return {"message": "Storage cleanup initiated"}
 
-def modify_frame_buffer_write(original_write_method):
-    """Modify the FrameBuffer.write method to integrate with motion storage"""
+def modify_frame_buffer_write(original_write_method, stream_buffer_instance=None):
+    """
+    Modify the FrameBuffer.write method to integrate with motion storage
+    
+    Args:
+        original_write_method: The original write method of the FrameBuffer instance
+        stream_buffer_instance: The specific FastAPI FrameBuffer instance to use
+                              (needed to avoid confusion with CircularFrameBuffer)
+    """
+    # We need to store a reference to the actual stream buffer instance from the FastAPI module
+    # This is different from our global frame_buffer which is a CircularFrameBuffer
+    stream_buffer = stream_buffer_instance
     
     def write_wrapper(self_or_frame, *args, **kwargs):
         """
@@ -1199,7 +1209,7 @@ def modify_frame_buffer_write(original_write_method):
         2. FileOutput._write: self._fileoutput.write(frame) -> write(frame)
         """
         global prev_frame, motion_detected, motion_regions
-        global frame_buffer  # Ensure access to the frame buffer instance
+        global frame_buffer  # This refers to the CircularFrameBuffer for storing frames
         
         # Detect calling pattern and adapt
         if hasattr(self_or_frame, 'raw_frame'):  # It's a direct method call
@@ -1211,20 +1221,20 @@ def modify_frame_buffer_write(original_write_method):
         else:  # It's called from PiCamera2 FileOutput._write
             # In this case, self_or_frame is actually the frame data
             buf = self_or_frame
-            # Use the saved original method from the frame_buffer instance
-            result = frame_buffer._original_write(buf)
+            # Use the saved original method from the stream buffer instance (from FastAPI)
+            result = stream_buffer._original_write(buf)
             
         try:
-            # If we can access frame_buffer and raw_frame, process the frame
-            if frame_buffer and hasattr(frame_buffer, 'raw_frame') and frame_buffer.raw_frame is not None:
-                # Add frame to circular buffer
-                frame_buffer.add_frame(frame_buffer.raw_frame.copy(), datetime.datetime.now())
+            # Now process the frame using the stream_buffer (the actual FastAPI FrameBuffer)
+            if stream_buffer and hasattr(stream_buffer, 'raw_frame') and stream_buffer.raw_frame is not None:
+                # Add the frame to our CircularFrameBuffer for motion detection
+                frame_buffer.add_frame(stream_buffer.raw_frame.copy(), datetime.datetime.now())
                 
                 # Handle motion recording if motion is detected
                 if motion_detected:
                     if not motion_recorder.recording:
                         motion_recorder.start_recording(motion_regions)
-                    motion_recorder.add_frame(frame_buffer.raw_frame.copy(), motion_regions)
+                    motion_recorder.add_frame(stream_buffer.raw_frame.copy(), motion_regions)
                 elif motion_recorder.recording:
                     motion_recorder.stop_recording()
         except Exception as e:
@@ -1260,7 +1270,7 @@ def initialize(app=None, camera_config=None):
         'transfer_manager': transfer_manager,
         'wifi_monitor': wifi_monitor,
         'storage_config': storage_config,
-        'modify_frame_buffer_write': modify_frame_buffer_write
+        'modify_frame_buffer_write': modify_frame_buffer_write  # Now expects an additional stream_buffer_instance parameter
     }
 
 if __name__ == "__main__":

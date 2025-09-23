@@ -252,8 +252,8 @@ async def lifespan(app: FastAPI):
         # Store the original write method on the instance for access by the wrapper
         frame_buffer._original_write = original_write
         
-        # Create the patched write method
-        patched_write = motion_storage['modify_frame_buffer_write'](original_write)
+        # Create the patched write method, passing our stream buffer instance explicitly
+        patched_write = motion_storage['modify_frame_buffer_write'](original_write, frame_buffer)
         
         # Replace the method with our patched version
         frame_buffer.write = patched_write
