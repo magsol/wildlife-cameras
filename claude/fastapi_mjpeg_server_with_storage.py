@@ -246,7 +246,20 @@ async def lifespan(app: FastAPI):
         motion_storage = init_motion_storage(app, camera_config)
         
         # Patch the frame buffer write method
-        frame_buffer.write = motion_storage['modify_frame_buffer_write'](frame_buffer.write)
+        # We need to patch it in a way that works with both direct calls and calls through PiCamera2
+        original_write = frame_buffer.write
+        
+        # Store the original write method on the instance for access by the wrapper
+        frame_buffer._original_write = original_write
+        
+        # Create the patched write method
+        patched_write = motion_storage['modify_frame_buffer_write'](original_write)
+        
+        # Replace the method with our patched version
+        frame_buffer.write = patched_write
+        
+        logger.info("Successfully patched frame buffer write method")
+
         
         # Register signal handlers for graceful shutdown
         for sig in (signal.SIGINT, signal.SIGTERM):

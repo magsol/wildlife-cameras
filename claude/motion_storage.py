@@ -1188,28 +1188,43 @@ def integrate_with_fastapi_server(app, camera_config):
 def modify_frame_buffer_write(original_write_method):
     """Modify the FrameBuffer.write method to integrate with motion storage"""
     
-    def write_wrapper(self, buf, *args, **kwargs):
+    def write_wrapper(self_or_frame, *args, **kwargs):
         """
         Wrapper to handle both direct calls and calls from PiCamera2's FileOutput.
-        The method signature needs to accept variadic args to match both call patterns:
-        - FrameBuffer.write(self, buf) - direct call
-        - FileOutput._write calling self._fileoutput.write(frame) - from PiCamera2
+        This wrapper detects whether it's being called directly as a method or 
+        indirectly through PiCamera2's FileOutput._write method and adapts accordingly.
+        
+        PiCamera2 calling patterns:
+        1. Direct method call: instance.write(buf) -> write(instance, buf)
+        2. FileOutput._write: self._fileoutput.write(frame) -> write(frame)
         """
         global prev_frame, motion_detected, motion_regions
+        global frame_buffer  # Ensure access to the frame buffer instance
         
-        # Call original write method with the same arguments it was called with
-        result = original_write_method(self, buf, *args, **kwargs)
-        
+        # Detect calling pattern and adapt
+        if hasattr(self_or_frame, 'raw_frame'):  # It's a direct method call
+            # This is a direct call with self as first arg
+            instance = self_or_frame
+            buf = args[0] if args else kwargs.get('buf')
+            # Call the original method through the instance's _original_write attribute
+            result = instance._original_write(buf, *args[1:], **kwargs)
+        else:  # It's called from PiCamera2 FileOutput._write
+            # In this case, self_or_frame is actually the frame data
+            buf = self_or_frame
+            # Use the saved original method from the frame_buffer instance
+            result = frame_buffer._original_write(buf)
+            
         try:
-            # Add frame to circular buffer if we have raw frame
-            if hasattr(self, 'raw_frame') and self.raw_frame is not None:
-                frame_buffer.add_frame(self.raw_frame.copy(), datetime.datetime.now())
+            # If we can access frame_buffer and raw_frame, process the frame
+            if frame_buffer and hasattr(frame_buffer, 'raw_frame') and frame_buffer.raw_frame is not None:
+                # Add frame to circular buffer
+                frame_buffer.add_frame(frame_buffer.raw_frame.copy(), datetime.datetime.now())
                 
                 # Handle motion recording if motion is detected
                 if motion_detected:
                     if not motion_recorder.recording:
                         motion_recorder.start_recording(motion_regions)
-                    motion_recorder.add_frame(self.raw_frame.copy(), motion_regions)
+                    motion_recorder.add_frame(frame_buffer.raw_frame.copy(), motion_regions)
                 elif motion_recorder.recording:
                     motion_recorder.stop_recording()
         except Exception as e:
