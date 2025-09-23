@@ -17,10 +17,9 @@ from fastapi.testclient import TestClient
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Mock the picamera2 module before importing
-sys.modules['picamera2'] = MagicMock()
-sys.modules['picamera2.encoders'] = MagicMock()
-sys.modules['picamera2.outputs'] = MagicMock()
+# Import test helpers to set up mocks before importing the modules
+from tests.test_helpers import setup_picamera2_mocks
+setup_picamera2_mocks()
 
 # Import module to test
 import fastapi_mjpeg_server_with_storage as server

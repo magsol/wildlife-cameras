@@ -1188,10 +1188,17 @@ def integrate_with_fastapi_server(app, camera_config):
 def modify_frame_buffer_write(original_write_method):
     """Modify the FrameBuffer.write method to integrate with motion storage"""
     
-    def write_wrapper(self, buf):
+    def write_wrapper(self, buf, *args, **kwargs):
+        """
+        Wrapper to handle both direct calls and calls from PiCamera2's FileOutput.
+        The method signature needs to accept variadic args to match both call patterns:
+        - FrameBuffer.write(self, buf) - direct call
+        - FileOutput._write calling self._fileoutput.write(frame) - from PiCamera2
+        """
         global prev_frame, motion_detected, motion_regions
         
-        result = original_write_method(self, buf)
+        # Call original write method with the same arguments it was called with
+        result = original_write_method(self, buf, *args, **kwargs)
         
         try:
             # Add frame to circular buffer if we have raw frame

@@ -14,6 +14,10 @@ from threading import Condition
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# Import test helpers to set up mocks before importing the modules
+from tests.test_helpers import setup_picamera2_mocks
+setup_picamera2_mocks()
+
 # Import module to test
 from motion_storage import (
     StorageConfig,

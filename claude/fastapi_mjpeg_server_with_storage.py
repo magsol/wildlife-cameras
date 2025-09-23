@@ -94,7 +94,12 @@ class FrameBuffer(io.BufferedIOBase):
         self.max_size = max_size
         self.raw_frame = None  # Store the raw frame for processing
         
-    def write(self, buf):
+    def write(self, buf, *args, **kwargs):
+        """
+        Write a new frame to the buffer.
+        This method accepts variadic arguments to handle both direct calls and calls 
+        from PiCamera2's FileOutput class.
+        """
         global prev_frame, motion_detected, motion_regions
         
         with self.condition:
@@ -294,6 +299,7 @@ class CameraConfigUpdate(BaseModel):
         return v
 
 # HTML template for video display
+# HTML template for video display - using double braces to escape CSS curly braces
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -301,32 +307,32 @@ HTML_TEMPLATE = """
     <title>Raspberry Pi Camera Stream</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body {
+        body {{
             font-family: Arial, sans-serif;
             margin: 0;
             padding: 20px;
             text-align: center;
             background-color: #f0f0f0;
-        }
-        h1 {
+        }}
+        h1 {{
             color: #333;
-        }
-        .container {
+        }}
+        .container {{
             max-width: 800px;
             margin: 0 auto;
             background: white;
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        }
-        img {
+        }}
+        img {{
             max-width: 100%;
             height: auto;
             border: 1px solid #ddd;
             border-radius: 4px;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        }
-        .status {
+        }}
+        .status {{
             margin-top: 15px;
             padding: 10px;
             background-color: #e8f4fd;
@@ -334,18 +340,18 @@ HTML_TEMPLATE = """
             font-size: 14px;
             display: flex;
             justify-content: space-between;
-        }
-        .status-left {
+        }}
+        .status-left {{
             text-align: left;
-        }
-        .status-right {
+        }}
+        .status-right {{
             text-align: right;
-        }
-        .error {
+        }}
+        .error {{
             color: red;
             display: none;
-        }
-        .motion-alert {
+        }}
+        .motion-alert {{
             background-color: #ffe8e8;
             color: #d32f2f;
             padding: 8px;
@@ -354,8 +360,8 @@ HTML_TEMPLATE = """
             display: none;
             font-weight: bold;
             border-left: 4px solid #d32f2f;
-        }
-        .motion-history {
+        }}
+        .motion-history {{
             margin-top: 20px;
             padding: 10px;
             background-color: #f5f5f5;
@@ -365,48 +371,48 @@ HTML_TEMPLATE = """
             max-height: 150px;
             overflow-y: auto;
             border: 1px solid #ddd;
-        }
-        .motion-history h3 {
+        }}
+        .motion-history h3 {{
             margin-top: 0;
             margin-bottom: 10px;
             font-size: 16px;
-        }
-        .motion-event {
+        }}
+        .motion-event {{
             padding: 5px;
             border-bottom: 1px solid #ddd;
-        }
-        .config-panel {
+        }}
+        .config-panel {{
             margin-top: 20px;
             text-align: left;
             padding: 15px;
             background-color: #f5f5f5;
             border-radius: 4px;
-        }
-        .config-panel h3 {
+        }}
+        .config-panel h3 {{
             margin-top: 0;
-        }
-        .form-group {
+        }}
+        .form-group {{
             margin-bottom: 10px;
-        }
-        .form-group label {
+        }}
+        .form-group label {{
             display: block;
             margin-bottom: 5px;
             font-weight: bold;
-        }
-        .form-group input {
+        }}
+        .form-group input {{
             padding: 5px;
             width: 100px;
-        }
-        .form-row {
+        }}
+        .form-row {{
             display: flex;
             align-items: center;
             margin-bottom: 10px;
-        }
-        .form-row label {
+        }}
+        .form-row label {{
             margin-right: 10px;
             margin-bottom: 0;
-        }
-        button {
+        }}
+        button {{
             background-color: #4CAF50;
             color: white;
             padding: 8px 16px;
@@ -414,15 +420,15 @@ HTML_TEMPLATE = """
             border-radius: 4px;
             cursor: pointer;
             font-size: 14px;
-        }
-        button:hover {
+        }}
+        button:hover {{
             background-color: #45a049;
-        }
-        .toggle-panel {
+        }}
+        .toggle-panel {{
             text-align: right;
             margin-top: 10px;
-        }
-        .storage-stats {
+        }}
+        .storage-stats {{
             margin-top: 20px;
             padding: 10px;
             background-color: #f9f9f9;
@@ -430,19 +436,19 @@ HTML_TEMPLATE = """
             font-size: 14px;
             border: 1px solid #ddd;
             display: none;
-        }
-        .storage-stats h3 {
+        }}
+        .storage-stats h3 {{
             margin-top: 0;
             margin-bottom: 10px;
-        }
-        .progress-bar {
+        }}
+        .progress-bar {{
             width: 100%;
             height: 20px;
             background-color: #e0e0e0;
             border-radius: 10px;
             margin: 10px 0;
-        }
-        .progress-bar-fill {
+        }}
+        .progress-bar-fill {{
             height: 100%;
             background-color: #4CAF50;
             border-radius: 10px;
@@ -450,22 +456,22 @@ HTML_TEMPLATE = """
             color: white;
             font-size: 12px;
             line-height: 20px;
-        }
-        .storage-events {
+        }}
+        .storage-events {{
             max-height: 200px;
             overflow-y: auto;
             font-size: 12px;
-        }
-        .storage-event {
+        }}
+        .storage-event {{
             padding: 5px;
             border-bottom: 1px solid #eee;
-        }
-        .storage-event-pending {
+        }}
+        .storage-event-pending {{
             color: #ff9800;
-        }
-        .storage-event-active {
+        }}
+        .storage-event-active {{
             color: #2196F3;
-        }
+        }}
     </style>
 </head>
 <body>
@@ -556,159 +562,159 @@ HTML_TEMPLATE = """
         const motionEvents = document.getElementById('motionEvents');
         
         // Handle stream errors
-        img.onerror = function() {
+        img.onerror = function() {{
             errorDiv.style.display = 'block';
             // Try to reconnect after 3 seconds
-            setTimeout(() => {
-                img.src = `/stream?cache=${new Date().getTime()}`;
-            }, 3000);
-        };
+            setTimeout(() => {{
+                img.src = `/stream?cache=${{new Date().getTime()}}`;
+            }}, 3000);
+        }};
         
         // Hide error when stream is working
-        img.onload = function() {
+        img.onload = function() {{
             errorDiv.style.display = 'none';
-        };
+        }};
         
         // Toggle panels
-        document.getElementById('toggleConfig').addEventListener('click', function() {
+        document.getElementById('toggleConfig').addEventListener('click', function() {{
             const panel = document.getElementById('configPanel');
             const isVisible = panel.style.display !== 'none';
             panel.style.display = isVisible ? 'none' : 'block';
             this.textContent = isVisible ? 'Show Configuration' : 'Hide Configuration';
-        });
+        }});
         
-        document.getElementById('toggleHistory').addEventListener('click', function() {
+        document.getElementById('toggleHistory').addEventListener('click', function() {{
             const panel = document.getElementById('motionHistory');
             const isVisible = panel.style.display !== 'none';
             panel.style.display = isVisible ? 'none' : 'block';
             this.textContent = isVisible ? 'Show Motion History' : 'Hide Motion History';
-        });
+        }});
         
-        document.getElementById('toggleStorage').addEventListener('click', function() {
+        document.getElementById('toggleStorage').addEventListener('click', function() {{
             const panel = document.getElementById('storageStats');
             const isVisible = panel.style.display !== 'none';
             panel.style.display = isVisible ? 'none' : 'block';
             this.textContent = isVisible ? 'Show Storage Stats' : 'Hide Storage Stats';
             
-            if (!isVisible) {
+            if (!isVisible) {{
                 updateStorageStats();
-            }
-        });
+            }}
+        }});
         
         // Save configuration
-        document.getElementById('saveConfig').addEventListener('click', function() {
-            const config = {
+        document.getElementById('saveConfig').addEventListener('click', function() {{
+            const config = {{
                 show_timestamp: document.getElementById('showTimestamp').checked,
                 timestamp_position: document.getElementById('timestampPosition').value,
                 motion_detection: document.getElementById('motionDetection').checked,
                 highlight_motion: document.getElementById('highlightMotion').checked,
                 motion_threshold: parseInt(document.getElementById('motionThreshold').value, 10)
-            };
+            }};
             
-            fetch('/config', {
+            fetch('/config', {{
                 method: 'POST',
-                headers: {
+                headers: {{
                     'Content-Type': 'application/json',
-                },
+                }},
                 body: JSON.stringify(config),
-            })
+            }})
             .then(response => response.json())
-            .then(data => {
+            .then(data => {{
                 alert('Configuration saved!');
-            })
-            .catch((error) => {
+            }})
+            .catch((error) => {{
                 alert('Error saving configuration');
-            });
-        });
+            }});
+        }});
         
         // Periodically check for motion and update status
-        setInterval(() => {
+        setInterval(() => {{
             fetch('/motion_status')
                 .then(response => response.json())
-                .then(data => {
+                .then(data => {{
                     // Update motion alert
                     motionAlert.style.display = data.motion_detected ? 'block' : 'none';
                     
                     // Update motion history
                     motionEvents.innerHTML = '';
-                    data.motion_history.forEach(event => {
+                    data.motion_history.forEach(event => {{
                         const eventDiv = document.createElement('div');
                         eventDiv.className = 'motion-event';
-                        eventDiv.textContent = `${event.timestamp} - ${event.regions.length} regions detected`;
+                        eventDiv.textContent = `${{event.timestamp}} - ${{event.regions.length}} regions detected`;
                         motionEvents.appendChild(eventDiv);
-                    });
+                    }});
                     
                     // Update connection count
                     document.getElementById('connectionCount').textContent = 
-                        `Connections: ${data.active_connections}`;
-                });
-        }, 1000);
+                        `Connections: ${{data.active_connections}}`;
+                }});
+        }}, 1000);
         
         // Update storage statistics
-        function updateStorageStats() {
+        function updateStorageStats() {{
             fetch('/storage/status')
                 .then(response => response.json())
-                .then(data => {
+                .then(data => {{
                     // Update storage usage bar
                     const usagePercent = data.storage.usage_percent;
                     const usageBar = document.getElementById('storageUsage');
-                    usageBar.style.width = `${usagePercent}%`;
-                    usageBar.textContent = `${usagePercent}%`;
+                    usageBar.style.width = `${{usagePercent}}%`;
+                    usageBar.textContent = `${{usagePercent}}%`;
                     
                     // Set color based on usage
-                    if (usagePercent < 70) {
+                    if (usagePercent < 70) {{
                         usageBar.style.backgroundColor = '#4CAF50';  // Green
-                    } else if (usagePercent < 90) {
+                    }} else if (usagePercent < 90) {{
                         usageBar.style.backgroundColor = '#ff9800';  // Orange
-                    } else {
+                    }} else {{
                         usageBar.style.backgroundColor = '#f44336';  // Red
-                    }
+                    }}
                     
                     // Update details
                     const details = document.getElementById('storageDetails');
                     details.innerHTML = `
-                        <p>Used: ${data.storage.size_mb} MB / ${data.storage.max_size_mb} MB</p>
-                        <p>Events: ${data.storage.event_count}</p>
-                        <p>Pending Transfers: ${data.transfer.pending_count}</p>
-                        <p>Transfer Window: ${data.transfer.schedule_active ? 
-                            data.transfer.schedule_window : 'Always'}</p>
-                        ${data.transfer.wifi_monitoring ? 
-                            `<p>WiFi Signal: ${data.transfer.wifi_monitoring.signal_strength} dBm</p>
-                             <p>Current Throttle: ${data.transfer.wifi_monitoring.current_throttle} KB/s</p>` : ''}
+                        <p>Used: ${{data.storage.size_mb}} MB / ${{data.storage.max_size_mb}} MB</p>
+                        <p>Events: ${{data.storage.event_count}}</p>
+                        <p>Pending Transfers: ${{data.transfer.pending_count}}</p>
+                        <p>Transfer Window: ${{data.transfer.schedule_active ? 
+                            data.transfer.schedule_window : 'Always'}}</p>
+                        ${{data.transfer.wifi_monitoring ? 
+                            `<p>WiFi Signal: ${{data.transfer.wifi_monitoring.signal_strength}} dBm</p>
+                             <p>Current Throttle: ${{data.transfer.wifi_monitoring.current_throttle}} KB/s</p>` : ''}}
                     `;
                     
                     // Update pending events
                     const pendingEvents = document.getElementById('pendingEvents');
-                    if (data.pending_events && data.pending_events.length > 0) {
+                    if (data.pending_events && data.pending_events.length > 0) {{
                         pendingEvents.innerHTML = '';
-                        data.pending_events.forEach(event => {
+                        data.pending_events.forEach(event => {{
                             const eventDiv = document.createElement('div');
                             eventDiv.className = 'storage-event';
-                            if (event.id in data.transfer.active_transfers) {
+                            if (event.id in data.transfer.active_transfers) {{
                                 eventDiv.classList.add('storage-event-active');
-                                eventDiv.innerHTML = `${event.id} - <strong>Uploading</strong> (${event.duration.toFixed(1)}s, ${event.frame_count} frames)`;
-                            } else {
+                                eventDiv.innerHTML = `${{event.id}} - <strong>Uploading</strong> (${{event.duration.toFixed(1)}}s, ${{event.frame_count}} frames)`;
+                            }} else {{
                                 eventDiv.classList.add('storage-event-pending');
-                                eventDiv.innerHTML = `${event.id} - <strong>Pending</strong> (${event.duration.toFixed(1)}s, ${event.frame_count} frames)`;
-                            }
+                                eventDiv.innerHTML = `${{event.id}} - <strong>Pending</strong> (${{event.duration.toFixed(1)}}s, ${{event.frame_count}} frames)`;
+                            }}
                             pendingEvents.appendChild(eventDiv);
-                        });
-                    } else {
+                        }});
+                    }} else {{
                         pendingEvents.innerHTML = '<p>No pending transfers</p>';
-                    }
-                })
-                .catch(error => {
+                    }}
+                }})
+                .catch(error => {{
                     console.error('Error fetching storage stats:', error);
-                });
-        }
+                }});
+        }}
         
         // Update storage stats every 5 seconds if visible
-        setInterval(() => {
+        setInterval(() => {{
             const storageStats = document.getElementById('storageStats');
-            if (storageStats.style.display !== 'none') {
+            if (storageStats.style.display !== 'none') {{
                 updateStorageStats();
-            }
-        }, 5000);
+            }}
+        }}, 5000);
     </script>
 </body>
 </html>
