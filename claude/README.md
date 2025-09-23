@@ -342,6 +342,19 @@ sudo systemctl start storage-server
    - Check for timeout settings in web server configuration
    - Increase chunk size for better performance
    - Decrease chunk size if experiencing timeouts
+   
+### Recent Bug Fixes
+
+Several bugs have been fixed in the latest version:
+
+1. Fixed FrameBuffer class inheritance to work with PiCamera2 requirements
+2. Fixed client management in the FrameBuffer class
+3. Improved hardware detection for better compatibility across different Raspberry Pi models
+4. Enhanced WiFi monitoring reliability on various platforms
+5. Improved error handling in chunked uploads with better retry mechanisms
+6. Fixed global variable scope issues across modules
+
+For detailed information about these fixes, see [Bug Fixes Documentation](documentation/bug_fixes.md)
 
 ## Advanced Usage
 
