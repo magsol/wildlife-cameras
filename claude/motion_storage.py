@@ -76,6 +76,9 @@ prev_frame = None
 motion_detected = False
 motion_regions = []
 
+# Global shutdown event for signaling threads to terminate
+shutdown_requested = threading.Event()
+
 # Storage configuration
 @dataclass
 class StorageConfig:
@@ -207,14 +210,29 @@ class MotionEventRecorder:
         
     def _process_events(self):
         """Worker thread to process recorded events"""
-        while True:
+        while not shutdown_requested.is_set():
             try:
-                _, event = self.events_queue.get()
-                self._save_event_to_disk(event)
-                self.events_queue.task_done()
+                try:
+                    # Use a timeout to check shutdown_requested periodically
+                    _, event = self.events_queue.get(timeout=1.0)
+                    self._save_event_to_disk(event)
+                    self.events_queue.task_done()
+                except queue.Empty:
+                    # No items in queue, just continue and check shutdown flag
+                    continue
             except Exception as e:
                 logger.error(f"Error processing motion event: {e}")
                 time.sleep(1)
+        
+        logger.info("Motion event processor thread exiting")
+        # Process any remaining items in the queue before exiting
+        while not self.events_queue.empty():
+            try:
+                _, event = self.events_queue.get_nowait()
+                self._save_event_to_disk(event)
+                self.events_queue.task_done()
+            except (queue.Empty, Exception):
+                break
                 
     def _save_event_to_disk(self, event):
         """Save a motion event to disk"""
@@ -407,7 +425,7 @@ class WiFiMonitor:
     
     def _monitor_signal(self):
         """Monitor WiFi signal strength and adjust throttle accordingly"""
-        while True:
+        while not shutdown_requested.is_set():
             try:
                 signal_strength = self._get_wifi_signal_strength()
                 
@@ -435,8 +453,13 @@ class WiFiMonitor:
             except Exception as e:
                 logger.error(f"Error monitoring WiFi signal: {e}")
                 
-            # Wait before checking again
-            time.sleep(WIFI_CHECK_INTERVAL)
+            # Wait before checking again - use smaller sleeps to check shutdown flag more frequently
+            for _ in range(int(WIFI_CHECK_INTERVAL)):
+                if shutdown_requested.is_set():
+                    break
+                time.sleep(1)
+                
+        logger.info("WiFi signal monitoring thread exiting")
     
     def _get_wifi_signal_strength(self):
         """Get WiFi signal strength in dBm using iwconfig"""
@@ -534,61 +557,79 @@ class TransferManager:
             
     def _transfer_worker(self):
         """Worker thread to process transfers"""
-        while True:
+        while not shutdown_requested.is_set():
             try:
-                _, event_id = self.transfer_queue.get()
-                
-                event_dir = os.path.join(self.config.local_storage_path, event_id)
-                if not os.path.exists(event_dir):
-                    if event_id in self.pending_events:
-                        self.pending_events.remove(event_id)
-                    self.transfer_queue.task_done()
-                    continue
-                
-                # Check if we're in the transfer window
-                current_hour = datetime.datetime.now().hour
-                in_transfer_window = (self.config.transfer_schedule_start <= current_hour < 
-                                     self.config.transfer_schedule_end)
-                
-                if self.config.transfer_schedule_active and not in_transfer_window:
-                    # Reschedule for later with low priority
-                    self.transfer_queue.put((100, event_id))
-                    self.transfer_queue.task_done()
-                    time.sleep(5)
-                    continue
-                
-                # Mark as active transfer
-                self.active_transfers.add(event_id)
-                
-                # Attempt to transfer
-                success = False
-                if self.config.chunk_upload:
-                    success = self._upload_event_chunked(event_id)
-                else:
-                    success = self._upload_event(event_id)
-                
-                if success:
-                    # Clean up local storage
-                    self._cleanup_event(event_id)
-                    if event_id in self.pending_events:
-                        self.pending_events.remove(event_id)
-                else:
-                    # Retry later with higher priority
-                    time.sleep(self.config.transfer_retry_interval_sec)
-                    self.transfer_queue.put((25, event_id))
+                try:
+                    # Use a timeout to check shutdown_requested periodically
+                    _, event_id = self.transfer_queue.get(timeout=1.0)
                     
-                # Remove from active transfers
-                if event_id in self.active_transfers:
-                    self.active_transfers.remove(event_id)
+                    event_dir = os.path.join(self.config.local_storage_path, event_id)
+                    if not os.path.exists(event_dir):
+                        if event_id in self.pending_events:
+                            self.pending_events.remove(event_id)
+                        self.transfer_queue.task_done()
+                        continue
                     
-                self.transfer_queue.task_done()
-                
-                # Throttle transfers (short pause between events)
-                time.sleep(1)
+                    # Check if we're in the transfer window
+                    current_hour = datetime.datetime.now().hour
+                    in_transfer_window = (self.config.transfer_schedule_start <= current_hour < 
+                                        self.config.transfer_schedule_end)
+                    
+                    if self.config.transfer_schedule_active and not in_transfer_window:
+                        # Reschedule for later with low priority
+                        self.transfer_queue.put((100, event_id))
+                        self.transfer_queue.task_done()
+                        time.sleep(5)
+                        continue
+                    
+                    # Check for shutdown before beginning transfer
+                    if shutdown_requested.is_set():
+                        # Put the item back in the queue and exit
+                        self.transfer_queue.put((50, event_id))
+                        self.transfer_queue.task_done()
+                        break
+                    
+                    # Mark as active transfer
+                    self.active_transfers.add(event_id)
+                    
+                    # Attempt to transfer
+                    success = False
+                    if self.config.chunk_upload:
+                        success = self._upload_event_chunked(event_id)
+                    else:
+                        success = self._upload_event(event_id)
+                    
+                    if success:
+                        # Clean up local storage
+                        self._cleanup_event(event_id)
+                        if event_id in self.pending_events:
+                            self.pending_events.remove(event_id)
+                    else:
+                        # Retry later with higher priority if we're not shutting down
+                        if not shutdown_requested.is_set():
+                            time.sleep(self.config.transfer_retry_interval_sec)
+                            self.transfer_queue.put((25, event_id))
+                        
+                    # Remove from active transfers
+                    if event_id in self.active_transfers:
+                        self.active_transfers.remove(event_id)
+                        
+                    self.transfer_queue.task_done()
+                    
+                    # Throttle transfers (short pause between events)
+                    if not shutdown_requested.is_set():
+                        time.sleep(1)
+                        
+                except queue.Empty:
+                    # No items in queue, just continue and check shutdown flag
+                    continue
                     
             except Exception as e:
                 logger.error(f"Error in transfer worker: {e}")
-                time.sleep(5)
+                if not shutdown_requested.is_set():
+                    time.sleep(5)
+        
+        logger.info("Transfer worker thread exiting")
                 
     def _upload_event(self, event_id):
         """Upload a motion event to remote storage (single request)"""
@@ -913,14 +954,19 @@ class TransferManager:
     
     def _disk_check_worker(self):
         """Periodic worker to check disk usage and clean up if needed"""
-        while True:
+        while not shutdown_requested.is_set():
             try:
                 self.check_disk_usage()
             except Exception as e:
                 logger.error(f"Error in disk check: {e}")
                 
-            # Check disk usage every 5 minutes
-            time.sleep(300)
+            # Check disk usage every 5 minutes - use smaller sleeps to check shutdown flag more frequently
+            for _ in range(60):  # 60 * 5 seconds = 300 seconds (5 minutes)
+                if shutdown_requested.is_set():
+                    break
+                time.sleep(5)
+        
+        logger.info("Disk check worker thread exiting")
             
     def check_disk_usage(self):
         """Check and clean up disk if needed"""
@@ -1248,6 +1294,10 @@ def modify_frame_buffer_write(original_write_method, stream_buffer_instance=None
 def initialize(app=None, camera_config=None):
     """Initialize the motion storage module and integrate with FastAPI server"""
     
+    # Reset the shutdown event (in case it was previously set)
+    global shutdown_requested
+    shutdown_requested.clear()
+    
     # Create storage directory if it doesn't exist
     os.makedirs(storage_config.local_storage_path, exist_ok=True)
     
@@ -1270,8 +1320,27 @@ def initialize(app=None, camera_config=None):
         'transfer_manager': transfer_manager,
         'wifi_monitor': wifi_monitor,
         'storage_config': storage_config,
-        'modify_frame_buffer_write': modify_frame_buffer_write  # Now expects an additional stream_buffer_instance parameter
+        'modify_frame_buffer_write': modify_frame_buffer_write,  # Now expects an additional stream_buffer_instance parameter
+        'shutdown': shutdown  # Add the shutdown function to the returned resources
     }
+
+def shutdown():
+    """Shutdown all background threads and processes"""
+    logger.info("Shutting down motion storage module...")
+    
+    # Set the shutdown event to signal all threads to exit
+    global shutdown_requested
+    shutdown_requested.set()
+    
+    # Give threads time to exit gracefully
+    logger.info("Waiting for background threads to exit...")
+    
+    # Wait a bit for threads to notice the shutdown event
+    time.sleep(2)
+    
+    logger.info("Motion storage module shutdown complete")
+    
+    return True
 
 if __name__ == "__main__":
     print("This module should be imported and initialized from the main FastAPI server.")

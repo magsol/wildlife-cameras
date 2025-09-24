@@ -29,7 +29,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 # Import motion storage module
 from motion_storage import initialize as init_motion_storage
@@ -223,15 +223,31 @@ def handle_shutdown(picam2):
     async def cleanup():
         logger.info("Shutting down camera and server...")
         
+        # First stop the camera recording
         if camera_initialized:
             try:
                 picam2.stop_recording()
                 logger.info("Camera recording stopped")
             except Exception as e:
                 logger.error(f"Error stopping camera recording: {e}")
-                
-        # Signal the shutdown event
+        
+        # Signal the streaming shutdown event
         shutdown_event.set()
+        
+        # Shutdown the motion storage module if it's initialized
+        if 'motion_storage' in globals() and motion_storage is not None:
+            try:
+                if 'shutdown' in motion_storage:
+                    motion_storage['shutdown']()
+                    logger.info("Motion storage module shutdown completed")
+            except Exception as e:
+                logger.error(f"Error shutting down motion storage: {e}")
+        
+        # Force exit after everything is cleaned up
+        logger.info("Shutdown completed, exiting process")
+        # Use a small delay to allow logs to be written
+        await asyncio.sleep(0.5)
+        os._exit(0)  # Force exit the process
     
     return cleanup
 
@@ -299,14 +315,14 @@ class CameraConfigUpdate(BaseModel):
     motion_min_area: Optional[int] = Field(None, ge=100, le=10000)
     highlight_motion: Optional[bool] = None
     
-    @validator('rotation')
-    def validate_rotation(cls, v):
+    @field_validator('rotation')
+    def validate_rotation(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v not in (0, 90, 180, 270):
             raise ValueError('Rotation must be 0, 90, 180, or 270 degrees')
         return v
         
-    @validator('timestamp_position')
-    def validate_timestamp_position(cls, v):
+    @field_validator('timestamp_position')
+    def validate_timestamp_position(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and v not in ('top-left', 'top-right', 'bottom-left', 'bottom-right'):
             raise ValueError('Timestamp position must be one of: top-left, top-right, bottom-left, bottom-right')
         return v
@@ -1090,13 +1106,14 @@ if __name__ == "__main__":
         logger.info(f"  WiFi monitoring: {'Enabled' if storage_config.wifi_monitoring else 'Disabled'}")
         logger.info(f"  Thumbnail generation: {'Enabled' if storage_config.generate_thumbnails else 'Disabled'}")
         
-        # Run the server
+        # Run the server with a timeout for graceful shutdown
         uvicorn.run(
             app,
             host=args.host,
             port=args.port,
             log_level="info",
-            reload=False
+            reload=False,
+            timeout_graceful_shutdown=5  # 5 seconds timeout for graceful shutdown
         )
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
