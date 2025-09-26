@@ -16,6 +16,7 @@ import io
 import logging
 import numpy as np
 import os
+import random
 import signal
 import sys
 import time
@@ -260,7 +261,11 @@ async def lifespan(app: FastAPI):
         # Initialize motion storage
         global motion_storage
         # Pass both camera_config AND storage_config to the motion_storage module
+        logger.info("[MOTION_FLOW] Initializing motion_storage module")
+        logger.info(f"[MOTION_FLOW] Storage config: path={storage_config.local_storage_path}, max_size={storage_config.max_disk_usage_mb}MB, upload={not storage_config.upload_throttle_kbps == 0}")
         motion_storage = init_motion_storage(app, camera_config, storage_config)
+        logger.info("[MOTION_FLOW] Motion storage module initialized")
+
         
         # Patch the frame buffer write method
         # We need to patch it in a way that works with both direct calls and calls through PiCamera2
@@ -959,6 +964,9 @@ def detect_motion(frame):
     if frame is None or not camera_config.motion_detection:
         return False, []
         
+    logger.debug("[MOTION_FLOW] Processing frame for motion detection")
+    frame_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
     try:
         # Convert to grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -968,6 +976,7 @@ def detect_motion(frame):
         
         # If first frame or prev_frame is None, initialize it
         if prev_frame is None:
+            logger.info(f"[MOTION_FLOW] {frame_time} Initializing first frame for motion detection")
             prev_frame = gray
             return False, []
         
@@ -999,13 +1008,19 @@ def detect_motion(frame):
         
         # If motion is detected, add to history
         if motion_detected:
-            motion_history.append((datetime.datetime.now(), regions))
+            motion_time = datetime.datetime.now()
+            motion_history.append((motion_time, regions))
             # Trim history if needed
             if len(motion_history) > camera_config.motion_history_size * 2:  # Keep twice the display size for history
                 motion_history = motion_history[-camera_config.motion_history_size * 2:]
+                
+            logger.info(f"[MOTION_FLOW] {frame_time} Motion detected! Regions: {len(regions)}, Contour areas: {[cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= camera_config.motion_min_area]}")
         
         # Update previous frame
         prev_frame = gray
+        
+        if not motion_detected and random.random() < 0.01:  # Log about 1% of non-motion frames to avoid excessive logging
+            logger.debug(f"[MOTION_FLOW] {frame_time} No motion detected")
         
         return motion_detected, regions
     except Exception as e:

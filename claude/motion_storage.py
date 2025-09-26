@@ -129,14 +129,22 @@ class CircularFrameBuffer:
     def add_frame(self, frame, timestamp):
         with self.lock:
             self.buffer.append((frame, timestamp))
+            frame_time = timestamp.strftime("%H:%M:%S.%f")[:-3]
+            
+            # Log every 30th frame to avoid excessive logs
+            if len(self.buffer) % 30 == 0:
+                logger.debug(f"[MOTION_FLOW] {frame_time} Added frame to CircularFrameBuffer. Buffer size: {len(self.buffer)}/{self.buffer.maxlen}")
             
     def get_recent_frames(self, seconds):
         with self.lock:
             if not self.buffer:
+                logger.debug(f"[MOTION_FLOW] Buffer empty when requesting recent frames")
                 return []
                 
             cutoff_time = self.buffer[-1][1] - datetime.timedelta(seconds=seconds)
-            return [frame for frame, ts in self.buffer if ts >= cutoff_time]
+            recent_frames = [frame for frame, ts in self.buffer if ts >= cutoff_time]
+            logger.info(f"[MOTION_FLOW] Retrieved {len(recent_frames)} recent frames from buffer (from past {seconds} seconds)")
+            return recent_frames
 
 # Motion event recorder
 class MotionEventRecorder:
@@ -158,14 +166,18 @@ class MotionEventRecorder:
     def start_recording(self, motion_regions):
         """Start recording a motion event"""
         if self.recording:
+            logger.debug(f"[MOTION_FLOW] Already recording motion - ignoring start_recording call")
             return
             
+        start_time = datetime.datetime.now()
+        event_id = self._generate_event_id()
+        
         self.recording = True
         self.current_event = {
-            "start_time": datetime.datetime.now(),
+            "start_time": start_time,
             "frames": [],
             "regions": motion_regions,
-            "id": self._generate_event_id()
+            "id": event_id
         }
         
         # Get buffer frames from before motion started
@@ -174,37 +186,61 @@ class MotionEventRecorder:
         )
         self.current_event["frames"].extend(pre_frames)
         
-        logger.info(f"Started recording motion event {self.current_event['id']}")
+        frame_time = start_time.strftime("%H:%M:%S.%f")[:-3]
+        logger.info(f"[MOTION_FLOW] {frame_time} Started recording motion event {event_id} - added {len(pre_frames)} pre-motion frames from buffer")
+        logger.info(f"[MOTION_FLOW] Event {event_id}: initial motion regions: {len(motion_regions)}")
+        
+        # Log the queue status
+        logger.info(f"[MOTION_FLOW] Current events queue size: {self.events_queue.qsize()}")
+        logger.debug(f"[MOTION_FLOW] Storage path: {self.config.local_storage_path}, Max size: {self.config.max_disk_usage_mb}MB")
         
     def add_frame(self, frame, motion_regions):
         """Add a frame to the current motion event"""
         if not self.recording:
             return
-            
-        self.current_event["frames"].append((frame, datetime.datetime.now()))
+        
+        timestamp = datetime.datetime.now()
+        self.current_event["frames"].append((frame, timestamp))
         self.current_event["regions"] = motion_regions
+        
+        # Log every 30th frame to reduce log volume
+        frames_count = len(self.current_event["frames"])
+        if frames_count % 30 == 0:
+            frame_time = timestamp.strftime("%H:%M:%S.%f")[:-3]
+            event_id = self.current_event["id"]
+            duration = (timestamp - self.current_event["start_time"]).total_seconds()
+            logger.debug(f"[MOTION_FLOW] {frame_time} Event {event_id}: added frame {frames_count}, current duration: {duration:.1f}s")
         
     def stop_recording(self):
         """Stop recording the current motion event"""
         if not self.recording:
+            logger.debug(f"[MOTION_FLOW] Not recording - ignoring stop_recording call")
             return
             
         self.recording = False
-        self.current_event["end_time"] = datetime.datetime.now()
+        end_time = datetime.datetime.now()
+        self.current_event["end_time"] = end_time
         
         # Check if event meets minimum duration
         duration = (self.current_event["end_time"] - 
                    self.current_event["start_time"]).total_seconds()
         
+        frame_time = end_time.strftime("%H:%M:%S.%f")[:-3]
+        event_id = self.current_event['id']
+        frames_count = len(self.current_event["frames"])
+        
         if duration >= self.config.min_motion_duration_sec:
             # Add to processing queue with priority based on size
-            priority = len(self.current_event["frames"])
+            priority = frames_count
             self.events_queue.put((priority, self.current_event))
-            logger.info(f"Stopped recording motion event {self.current_event['id']} "
-                       f"({len(self.current_event['frames'])} frames, {duration:.1f}s)")
+            
+            logger.info(f"[MOTION_FLOW] {frame_time} Stopped recording motion event {event_id} - ")
+            logger.info(f"[MOTION_FLOW] Event {event_id}: {frames_count} frames, {duration:.1f}s duration")
+            logger.info(f"[MOTION_FLOW] Event {event_id}: Added to processing queue with priority {priority}")
+            logger.info(f"[MOTION_FLOW] Events queue size now: {self.events_queue.qsize()}")
         else:
-            logger.info(f"Discarded motion event {self.current_event['id']} "
-                       f"(duration {duration:.1f}s < minimum {self.config.min_motion_duration_sec}s)")
+            logger.info(f"[MOTION_FLOW] {frame_time} Discarded motion event {event_id} ")
+            logger.info(f"[MOTION_FLOW] Event {event_id}: Duration too short ({duration:.1f}s < minimum {self.config.min_motion_duration_sec}s)")
         
         self.current_event = None
         
@@ -214,14 +250,25 @@ class MotionEventRecorder:
             try:
                 try:
                     # Use a timeout to check shutdown_requested periodically
+                    logger.debug(f"[MOTION_FLOW] Worker thread checking event queue. Size: {self.events_queue.qsize()}")
                     _, event = self.events_queue.get(timeout=1.0)
+                    
+                    event_id = event['id']
+                    frame_count = len(event['frames'])
+                    duration = (event['end_time'] - event['start_time']).total_seconds()
+                    frame_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    
+                    logger.info(f"[MOTION_FLOW] {frame_time} Processing event {event_id} ({frame_count} frames, {duration:.1f}s)")
                     self._save_event_to_disk(event)
                     self.events_queue.task_done()
+                    
+                    logger.info(f"[MOTION_FLOW] {frame_time} Event queue size after processing: {self.events_queue.qsize()}")
+                    
                 except queue.Empty:
                     # No items in queue, just continue and check shutdown flag
                     continue
             except Exception as e:
-                logger.error(f"Error processing motion event: {e}")
+                logger.error(f"[MOTION_FLOW] Error processing motion event: {e}")
                 time.sleep(1)
         
         logger.info("Motion event processor thread exiting")
@@ -236,23 +283,55 @@ class MotionEventRecorder:
                 
     def _save_event_to_disk(self, event):
         """Save a motion event to disk"""
+        event_id = event["id"]
+        event_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
         # Create directory structure
         event_dir = os.path.join(
             self.config.local_storage_path,
-            event["id"]
+            event_id
         )
+        
+        logger.info(f"[MOTION_FLOW] {event_time} Creating directory for event {event_id}: {event_dir}")
         os.makedirs(event_dir, exist_ok=True)
+        
+        # Check if directory was created successfully
+        if not os.path.exists(event_dir):
+            logger.error(f"[MOTION_FLOW] {event_time} Failed to create directory for event {event_id}!")
+            return
+        else:
+            logger.info(f"[MOTION_FLOW] {event_time} Directory for event {event_id} created successfully")
+            logger.info(f"[MOTION_FLOW] Directory exists check: {os.path.exists(event_dir)}")
+            logger.info(f"[MOTION_FLOW] Directory permissions: {oct(os.stat(event_dir).st_mode)[-3:]}")
+            logger.info(f"[MOTION_FLOW] Parent directory: {os.path.dirname(event_dir)}")
+            logger.info(f"[MOTION_FLOW] Parent exists check: {os.path.exists(os.path.dirname(event_dir))}")
+            
+        # Check storage space
+        try:
+            statvfs = os.statvfs(self.config.local_storage_path)
+            free_mb = (statvfs.f_frsize * statvfs.f_bavail) / (1024 * 1024)
+            logger.info(f"[MOTION_FLOW] Free disk space: {free_mb:.1f} MB")  
+        except Exception as e:
+            logger.error(f"[MOTION_FLOW] Error checking disk space: {e}")
         
         try:
             # Use temporary file for video assembly to avoid SD card wear
             with tempfile.NamedTemporaryFile(suffix='.h264') as temp_video:
                 # Use hardware encoding to create video
+                event_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                event_id = event["id"]
+                frame_count = len(event["frames"])
+                
+                logger.info(f"[MOTION_FLOW] {event_time} Encoding video for event {event_id} ({frame_count} frames)")
                 self._encode_video(event["frames"], temp_video.name)
+                logger.info(f"[MOTION_FLOW] {event_time} Video encoding complete for event {event_id} - temp file: {temp_video.name}")
                 
                 # Generate thumbnails if enabled
                 thumbnails = []
                 if self.config.generate_thumbnails:
+                    logger.info(f"[MOTION_FLOW] {event_time} Generating thumbnails for event {event_id}")
                     thumbnails = self._generate_thumbnails(event["frames"])
+                    logger.info(f"[MOTION_FLOW] {event_time} Generated {len(thumbnails)} thumbnails for event {event_id}")
                 
                 # Save metadata
                 metadata = {
@@ -271,8 +350,22 @@ class MotionEventRecorder:
                 }
                 
                 # Write metadata file
-                with open(os.path.join(event_dir, "metadata.json"), "w") as f:
+                metadata_path = os.path.join(event_dir, "metadata.json")
+                event_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                event_id = event["id"]
+                
+                logger.info(f"[MOTION_FLOW] {event_time} Writing metadata for event {event_id} to {metadata_path}")
+                with open(metadata_path, "w") as f:
                     json.dump(metadata, f, indent=2)
+                    
+                # Verify metadata was written
+                if os.path.exists(metadata_path):
+                    logger.info(f"[MOTION_FLOW] {event_time} Metadata file created successfully for event {event_id}")
+                    # Check file size
+                    metadata_size = os.path.getsize(metadata_path)
+                    logger.info(f"[MOTION_FLOW] {event_time} Metadata file size: {metadata_size} bytes")
+                else:
+                    logger.error(f"[MOTION_FLOW] {event_time} Failed to create metadata file for event {event_id}!")
                     
                 # Save thumbnails
                 if thumbnails:
@@ -285,10 +378,25 @@ class MotionEventRecorder:
                     
                 # Copy video to final location
                 final_video_path = os.path.join(event_dir, "motion.mp4")
+                event_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                event_id = event["id"]
+                
+                logger.info(f"[MOTION_FLOW] {event_time} Copying video for event {event_id} from {temp_video.name} to {final_video_path}")
                 shutil.copy(temp_video.name, final_video_path)
                 
+                # Verify video was copied
+                if os.path.exists(final_video_path):
+                    video_size = os.path.getsize(final_video_path)
+                    logger.info(f"[MOTION_FLOW] {event_time} Video copied successfully for event {event_id}. Size: {video_size/1024:.1f} KB")
+                else:
+                    logger.error(f"[MOTION_FLOW] {event_time} Failed to copy video file for event {event_id}!")
+                
             # Notify transfer manager
-            transfer_manager.add_event(event["id"])
+            event_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            event_id = event["id"]
+            logger.info(f"[MOTION_FLOW] {event_time} Notifying transfer manager about event {event_id}")
+            transfer_manager.add_event(event_id)
+            logger.info(f"[MOTION_FLOW] {event_time} Event {event_id} added to transfer manager's queue")
             
         except Exception as e:
             logger.error(f"Error saving event {event['id']} to disk: {e}")
@@ -536,24 +644,51 @@ class TransferManager:
         
     def add_event(self, event_id):
         """Add an event to the transfer queue"""
+        event_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
         if event_id in self.pending_events:
+            logger.info(f"[TRANSFER_FLOW] {event_time} Event {event_id} already in pending events - skipping")
             return
             
         self.pending_events.add(event_id)
+        logger.info(f"[TRANSFER_FLOW] {event_time} Added event {event_id} to pending events set. Size now: {len(self.pending_events)}")
         
+        # Check if event directory exists
+        event_dir = os.path.join(self.config.local_storage_path, event_id)
+        if not os.path.exists(event_dir):
+            logger.error(f"[TRANSFER_FLOW] {event_time} Event directory doesn't exist: {event_dir}")
+            # List parent directory contents
+            parent_dir = os.path.dirname(event_dir)
+            if os.path.exists(parent_dir):
+                logger.info(f"[TRANSFER_FLOW] {event_time} Parent directory exists. Contents: {os.listdir(parent_dir)}")
+            else:
+                logger.error(f"[TRANSFER_FLOW] {event_time} Parent directory doesn't exist: {parent_dir}")
+            return
+            
+        # Check if transfer is enabled
+        if self.config.upload_throttle_kbps == 0:
+            logger.info(f"[TRANSFER_FLOW] {event_time} Transfers disabled (upload_throttle_kbps=0) for event {event_id}")
+            return
+            
         # Check if we should transfer now or during scheduled time
         current_hour = datetime.datetime.now().hour
         in_transfer_window = (self.config.transfer_schedule_start <= current_hour < 
                              self.config.transfer_schedule_end)
+        
+        logger.info(f"[TRANSFER_FLOW] {event_time} Transfer schedule active: {self.config.transfer_schedule_active}, ")
+        logger.info(f"[TRANSFER_FLOW] {event_time} Current hour: {current_hour}, Window: {self.config.transfer_schedule_start}-{self.config.transfer_schedule_end}")
+        logger.info(f"[TRANSFER_FLOW] {event_time} In transfer window: {in_transfer_window}")
                              
         if not self.config.transfer_schedule_active or in_transfer_window:
             # Immediate transfer with normal priority
             self.transfer_queue.put((50, event_id))
-            logger.info(f"Added event {event_id} to transfer queue (immediate)")
+            logger.info(f"[TRANSFER_FLOW] {event_time} Added event {event_id} to transfer queue (immediate)")
         else:
             # Scheduled transfer with low priority
             self.transfer_queue.put((100, event_id))
-            logger.info(f"Added event {event_id} to transfer queue (scheduled)")
+            logger.info(f"[TRANSFER_FLOW] {event_time} Added event {event_id} to transfer queue (scheduled)")
+            
+        logger.info(f"[TRANSFER_FLOW] {event_time} Transfer queue size now: {self.transfer_queue.qsize()}")
             
     def _transfer_worker(self):
         """Worker thread to process transfers"""
