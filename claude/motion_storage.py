@@ -1291,12 +1291,37 @@ def modify_frame_buffer_write(original_write_method, stream_buffer_instance=None
     return write_wrapper
 
 # Function to initialize the module
-def initialize(app=None, camera_config=None):
+def initialize(app=None, camera_config=None, external_storage_config=None):
     """Initialize the motion storage module and integrate with FastAPI server"""
     
     # Reset the shutdown event (in case it was previously set)
     global shutdown_requested
     shutdown_requested.clear()
+    
+    # Use the provided storage_config if available, otherwise keep using our default
+    global storage_config, frame_buffer, wifi_monitor, transfer_manager, motion_recorder
+    
+    # Update our storage config with values from external_storage_config if provided
+    if external_storage_config is not None:
+        logger.info("Using storage configuration from FastAPI server")
+        # Copy all attributes from the external config to our internal config
+        for attr in dir(external_storage_config):
+            # Skip private/special attributes
+            if attr.startswith('_'):
+                continue
+            # Skip methods/callables
+            if callable(getattr(external_storage_config, attr)):
+                continue
+            # Copy the attribute value if it exists in our storage_config too
+            if hasattr(storage_config, attr):
+                setattr(storage_config, attr, getattr(external_storage_config, attr))
+        logger.info(f"Using storage path: {storage_config.local_storage_path}")
+    
+    # Reinitialize components with updated config
+    frame_buffer = CircularFrameBuffer(max_size=storage_config.max_ram_segments)
+    wifi_monitor = WiFiMonitor(storage_config)
+    transfer_manager = TransferManager(storage_config, wifi_monitor)
+    motion_recorder = MotionEventRecorder(frame_buffer, storage_config)
     
     # Create storage directory if it doesn't exist
     os.makedirs(storage_config.local_storage_path, exist_ok=True)

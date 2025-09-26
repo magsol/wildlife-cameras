@@ -259,7 +259,8 @@ async def lifespan(app: FastAPI):
         
         # Initialize motion storage
         global motion_storage
-        motion_storage = init_motion_storage(app, camera_config)
+        # Pass both camera_config AND storage_config to the motion_storage module
+        motion_storage = init_motion_storage(app, camera_config, storage_config)
         
         # Patch the frame buffer write method
         # We need to patch it in a way that works with both direct calls and calls through PiCamera2
