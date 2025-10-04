@@ -1,0 +1,71 @@
+[project]
+name = "wildlife-cameras"
+version = "0.1.0"
+description = "Raspberry Pi NoIR camera motion detection and video storage system"
+authors = ["Shannon Quinn"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.9,<3.12"
+fastapi = "*"
+uvicorn = "*"
+opencv = "*"
+numpy = "*"
+pydantic = "==2.11.9"
+requests = "*"
+pyyaml = "*"
+
+[feature.dev.dependencies]
+pytest = "*"
+pytest-asyncio = "*"
+pytest-cov = "*"
+pytest-mock = "*"
+httpx = "*"  # For testing FastAPI endpoints
+
+[feature.lint.dependencies]
+ruff = "*"
+black = "*"
+isort = "*"
+
+[feature.optical_flow_test.dependencies]
+matplotlib = "*"
+scikit-learn = "*"
+pytest = "*"
+pytest-mock = "*"
+
+[tasks]
+# System package installation task
+install-system-deps = { cmd = "echo 'On Raspberry Pi, run: sudo apt install python3-picamera2 --no-install-recommends'" }
+
+# Default environment tasks
+start = { cmd = "python fastapi_mjpeg_server_with_storage.py" }
+storage-server = { cmd = "python storage_server.py" }
+
+# Testing tasks
+test = { cmd = "pytest tests/" }
+test-verbose = { cmd = "pytest -vv tests/" }
+test-coverage = { cmd = "pytest --cov=. tests/" }
+test-without-picamera = { cmd = "SKIP_PICAMERA=1 pytest tests/" }
+
+# Optical flow testing tasks
+test-optical-flow = { cmd = "pytest -vv tests/test_optical_flow_analyzer.py" }
+test-optical-flow-cov = { cmd = "pytest --cov=optical_flow_analyzer tests/test_optical_flow_analyzer.py" }
+test-video = { cmd = "python test_optical_flow.py --mode video --input $1" }
+test-camera = { cmd = "python test_optical_flow.py --mode camera --duration $1" }
+benchmark = { cmd = "python test_optical_flow.py --mode benchmark --input $1" }
+
+# Linting tasks
+format = { cmd = "ruff format ." }
+lint = { cmd = "ruff check ." }
+check = { cmd = "ruff check --fix ." }
+sort-imports = { cmd = "isort ." }
+
+# Development workflow task
+dev-workflow = { cmd = "echo 'Running development workflow...' && pixi run lint && pixi run format && pixi run test" }
+
+[environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "dev" }
+lint = { features = ["lint"], solve-group = "lint" }
+optical_flow_test = { features = ["optical_flow_test"], solve-group = "optical_flow_test" }

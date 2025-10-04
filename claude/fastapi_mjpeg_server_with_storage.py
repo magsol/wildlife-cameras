@@ -1014,7 +1014,12 @@ def detect_motion(frame):
             if len(motion_history) > camera_config.motion_history_size * 2:  # Keep twice the display size for history
                 motion_history = motion_history[-camera_config.motion_history_size * 2:]
                 
-            logger.info(f"[MOTION_FLOW] {frame_time} Motion detected! Regions: {len(regions)}, Contour areas: {[cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= camera_config.motion_min_area]}")
+            # Log with high visibility to track motion detection precisely
+            contour_areas = [cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= camera_config.motion_min_area]
+            logger.critical(f"[MOTION_DETECTED] {frame_time} Motion detected! Regions: {len(regions)}")
+            logger.critical(f"[MOTION_DETECTED] Contour areas: {contour_areas}")
+            logger.critical(f"[MOTION_DETECTED] Motion threshold: {camera_config.motion_threshold}, Min area: {camera_config.motion_min_area}")
+            logger.info(f"[MOTION_FLOW] {frame_time} Motion detected! Regions: {len(regions)}, Contour areas: {contour_areas}")
         
         # Update previous frame
         prev_frame = gray

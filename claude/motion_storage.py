@@ -63,13 +63,19 @@ MAX_UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
 MAX_RETRIES = 5
 WIFI_CHECK_INTERVAL = 30  # seconds
 
-# Configure logging
+# Configure logging - Set to DEBUG to capture all levels
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed from INFO to DEBUG to capture more detailed logs
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger("motion_storage")
+
+# Force this module's logger to DEBUG level to ensure we capture all logs
+logger.setLevel(logging.DEBUG)
+
+# Add an explicit startup message to verify logging is working
+logger.critical("MOTION_STORAGE MODULE LOADED - LOGGING INITIALIZED AT DEBUG LEVEL")
 
 # Motion detection variables - initialized here for module scope
 prev_frame = None
@@ -125,26 +131,72 @@ class CircularFrameBuffer:
     def __init__(self, max_size=300):  # Default: 10 seconds @ 30fps
         self.buffer = deque(maxlen=max_size)
         self.lock = threading.Lock()
+        logger.debug(f"[CRITICAL_DEBUG] CircularFrameBuffer initialized with max_size={max_size}")
+        self.frames_added = 0  # Track total frames added for debugging
         
     def add_frame(self, frame, timestamp):
         with self.lock:
-            self.buffer.append((frame, timestamp))
             frame_time = timestamp.strftime("%H:%M:%S.%f")[:-3]
             
-            # Log every 30th frame to avoid excessive logs
-            if len(self.buffer) % 30 == 0:
-                logger.debug(f"[MOTION_FLOW] {frame_time} Added frame to CircularFrameBuffer. Buffer size: {len(self.buffer)}/{self.buffer.maxlen}")
+            # Enhanced logging for CircularFrameBuffer
+            self.frames_added += 1
+            
+            # Check frame quality
+            frame_ok = frame is not None
+            frame_shape = frame.shape if frame_ok and hasattr(frame, 'shape') else 'N/A'
+            
+            # Critical debug log for first 5 frames, then every 30th frame
+            if self.frames_added <= 5 or self.frames_added % 30 == 0:
+                logger.debug(f"[CRITICAL_DEBUG] {frame_time} CircularFrameBuffer.add_frame called")
+                logger.debug(f"[CRITICAL_DEBUG] {frame_time} Frame #{self.frames_added}, valid: {frame_ok}, shape: {frame_shape}")
+                logger.debug(f"[CRITICAL_DEBUG] {frame_time} Buffer before add: {len(self.buffer)}/{self.buffer.maxlen}")
+            
+            # Add to buffer
+            try:
+                self.buffer.append((frame, timestamp))
+                
+                # Verify frame was added
+                if self.frames_added <= 5 or self.frames_added % 30 == 0:
+                    logger.debug(f"[CRITICAL_DEBUG] {frame_time} Buffer after add: {len(self.buffer)}/{self.buffer.maxlen}")
+            except Exception as e:
+                logger.error(f"[CRITICAL_DEBUG] {frame_time} ERROR adding frame to buffer: {e}")
+                import traceback
+                logger.error(f"[CRITICAL_DEBUG] {frame_time} Error traceback: {traceback.format_exc()}")
             
     def get_recent_frames(self, seconds):
         with self.lock:
+            current_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            
             if not self.buffer:
-                logger.debug(f"[MOTION_FLOW] Buffer empty when requesting recent frames")
+                logger.error(f"[CRITICAL_DEBUG] {current_time} Buffer EMPTY when requesting recent frames!")
+                logger.error(f"[CRITICAL_DEBUG] {current_time} Total frames ever added: {self.frames_added}")
                 return []
+            
+            # Log buffer details
+            buffer_len = len(self.buffer)
+            buffer_timespan = None
+            if buffer_len >= 2:
+                buffer_timespan = (self.buffer[-1][1] - self.buffer[0][1]).total_seconds()
                 
-            cutoff_time = self.buffer[-1][1] - datetime.timedelta(seconds=seconds)
-            recent_frames = [frame for frame, ts in self.buffer if ts >= cutoff_time]
-            logger.info(f"[MOTION_FLOW] Retrieved {len(recent_frames)} recent frames from buffer (from past {seconds} seconds)")
-            return recent_frames
+            logger.debug(f"[CRITICAL_DEBUG] {current_time} get_recent_frames({seconds}) called")
+            logger.debug(f"[CRITICAL_DEBUG] {current_time} Current buffer size: {buffer_len}/{self.buffer.maxlen}")
+            logger.debug(f"[CRITICAL_DEBUG] {current_time} Buffer timespan: {buffer_timespan}s")
+            
+            # Get frames from the buffer within the timespan
+            try:
+                cutoff_time = self.buffer[-1][1] - datetime.timedelta(seconds=seconds)
+                recent_frames = [frame for frame, ts in self.buffer if ts >= cutoff_time]
+                
+                logger.info(f"[CRITICAL_DEBUG] {current_time} Retrieved {len(recent_frames)} recent frames from buffer (from past {seconds} seconds)")
+                logger.info(f"[CRITICAL_DEBUG] {current_time} Retrieval success rate: {len(recent_frames)}/{buffer_len}")
+                
+                return recent_frames
+                
+            except Exception as e:
+                logger.error(f"[CRITICAL_DEBUG] {current_time} ERROR retrieving recent frames: {e}")
+                import traceback
+                logger.error(f"[CRITICAL_DEBUG] {current_time} Error traceback: {traceback.format_exc()}")
+                return []
 
 # Motion event recorder
 class MotionEventRecorder:
@@ -172,6 +224,11 @@ class MotionEventRecorder:
         start_time = datetime.datetime.now()
         event_id = self._generate_event_id()
         
+        # Log motion event start with high visibility
+        frame_time = start_time.strftime("%H:%M:%S.%f")[:-3]
+        logger.critical(f"[EVENT_STARTED] {frame_time} NEW MOTION EVENT STARTED - ID: {event_id}")
+        logger.critical(f"[EVENT_STARTED] Motion regions: {len(motion_regions)}, min duration threshold: {self.config.min_motion_duration_sec}s")
+        
         self.recording = True
         self.current_event = {
             "start_time": start_time,
@@ -181,12 +238,19 @@ class MotionEventRecorder:
         }
         
         # Get buffer frames from before motion started
+        logger.debug(f"[EVENT_STARTED] {frame_time} Getting pre-motion frames from buffer (past {self.config.ram_buffer_seconds}s)")
         pre_frames = self.frame_buffer.get_recent_frames(
             self.config.ram_buffer_seconds
         )
         self.current_event["frames"].extend(pre_frames)
         
-        frame_time = start_time.strftime("%H:%M:%S.%f")[:-3]
+        # Always log the buffer details
+        if hasattr(self.frame_buffer, 'buffer'):
+            buffer_size = len(self.frame_buffer.buffer) if hasattr(self.frame_buffer.buffer, '__len__') else 'unknown'
+            logger.critical(f"[EVENT_STARTED] {frame_time} Current frame buffer size: {buffer_size}")
+        
+        # Log the event creation details
+        logger.critical(f"[EVENT_STARTED] {frame_time} Added {len(pre_frames)} pre-motion frames from buffer")
         logger.info(f"[MOTION_FLOW] {frame_time} Started recording motion event {event_id} - added {len(pre_frames)} pre-motion frames from buffer")
         logger.info(f"[MOTION_FLOW] Event {event_id}: initial motion regions: {len(motion_regions)}")
         
@@ -229,6 +293,9 @@ class MotionEventRecorder:
         event_id = self.current_event['id']
         frames_count = len(self.current_event["frames"])
         
+        # CRITICAL DEBUG - Always log the duration check with high visibility
+        logger.critical(f"[EVENT_DURATION] {frame_time} Motion event {event_id}: duration={duration:.3f}s, min={self.config.min_motion_duration_sec}s, frames={frames_count}")
+        
         if duration >= self.config.min_motion_duration_sec:
             # Add to processing queue with priority based on size
             priority = frames_count
@@ -238,7 +305,20 @@ class MotionEventRecorder:
             logger.info(f"[MOTION_FLOW] Event {event_id}: {frames_count} frames, {duration:.1f}s duration")
             logger.info(f"[MOTION_FLOW] Event {event_id}: Added to processing queue with priority {priority}")
             logger.info(f"[MOTION_FLOW] Events queue size now: {self.events_queue.qsize()}")
+            
+            # Also log storage path to verify where event should be saved
+            logger.critical(f"[EVENT_ACCEPTED] {frame_time} Motion event {event_id} ACCEPTED - will be saved to {self.config.local_storage_path}/{event_id}")
         else:
+            # Log with higher visibility for brief motion events
+            logger.critical(f"[EVENT_REJECTED] {frame_time} Motion event {event_id} REJECTED - duration too short")
+            logger.critical(f"[EVENT_REJECTED] Duration {duration:.3f}s < minimum {self.config.min_motion_duration_sec}s threshold")
+            logger.critical(f"[EVENT_REJECTED] Frames captured: {frames_count}, Config: {self.config}")
+            
+            # Log more details about the motion that was detected but rejected
+            if "regions" in self.current_event and self.current_event["regions"]:
+                regions_count = len(self.current_event["regions"])
+                logger.critical(f"[EVENT_REJECTED] Motion regions detected: {regions_count}")
+                
             logger.info(f"[MOTION_FLOW] {frame_time} Discarded motion event {event_id} ")
             logger.info(f"[MOTION_FLOW] Event {event_id}: Duration too short ({duration:.1f}s < minimum {self.config.min_motion_duration_sec}s)")
         
@@ -1379,6 +1459,19 @@ def modify_frame_buffer_write(original_write_method, stream_buffer_instance=None
     # This is different from our global frame_buffer which is a CircularFrameBuffer
     stream_buffer = stream_buffer_instance
     
+    # Log key information about the function's inputs to help diagnose connection issues
+    logger.debug(f"[CRITICAL_DEBUG] modify_frame_buffer_write called with:")
+    logger.debug(f"[CRITICAL_DEBUG]   - original_write_method: {original_write_method}")
+    logger.debug(f"[CRITICAL_DEBUG]   - stream_buffer_instance: {stream_buffer_instance}")
+    if stream_buffer_instance:
+        logger.debug(f"[CRITICAL_DEBUG]   - stream_buffer attributes: {dir(stream_buffer_instance)}")
+        if hasattr(stream_buffer_instance, '_original_write'):
+            logger.debug(f"[CRITICAL_DEBUG]   - _original_write exists on stream_buffer")
+        else:
+            logger.error(f"[CRITICAL_DEBUG]   - ERROR: _original_write MISSING on stream_buffer!")
+    else:
+        logger.error(f"[CRITICAL_DEBUG]   - ERROR: stream_buffer_instance is None!")
+    
     def write_wrapper(self_or_frame, *args, **kwargs):
         """
         Wrapper to handle both direct calls and calls from PiCamera2's FileOutput.
@@ -1392,34 +1485,113 @@ def modify_frame_buffer_write(original_write_method, stream_buffer_instance=None
         global prev_frame, motion_detected, motion_regions
         global frame_buffer  # This refers to the CircularFrameBuffer for storing frames
         
+        # Add call logging - timestamp in milliseconds for precise tracking
+        call_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        logger.debug(f"[CRITICAL_DEBUG] {call_time} write_wrapper called")
+        logger.debug(f"[CRITICAL_DEBUG] {call_time} self_or_frame type: {type(self_or_frame)}")
+        logger.debug(f"[CRITICAL_DEBUG] {call_time} args: {args}")
+        logger.debug(f"[CRITICAL_DEBUG] {call_time} stream_buffer: {stream_buffer is not None}")
+        logger.debug(f"[CRITICAL_DEBUG] {call_time} motion_detected: {motion_detected}")
+        
         # Detect calling pattern and adapt
         if hasattr(self_or_frame, 'raw_frame'):  # It's a direct method call
+            logger.debug(f"[CRITICAL_DEBUG] {call_time} Direct method call detected")
             # This is a direct call with self as first arg
             instance = self_or_frame
             buf = args[0] if args else kwargs.get('buf')
+            
+            # Verify instance has _original_write
+            if not hasattr(instance, '_original_write'):
+                logger.error(f"[CRITICAL_DEBUG] {call_time} ERROR: instance missing _original_write attribute!")
+                logger.error(f"[CRITICAL_DEBUG] {call_time} instance attributes: {dir(instance)}")
+                # Fallback to original method directly
+                logger.error(f"[CRITICAL_DEBUG] {call_time} Falling back to original_write_method directly")
+                return original_write_method(instance, buf, *args[1:], **kwargs)
+                
             # Call the original method through the instance's _original_write attribute
+            logger.debug(f"[CRITICAL_DEBUG] {call_time} Calling instance._original_write")
             result = instance._original_write(buf, *args[1:], **kwargs)
         else:  # It's called from PiCamera2 FileOutput._write
+            logger.debug(f"[CRITICAL_DEBUG] {call_time} PiCamera2 FileOutput call detected")
             # In this case, self_or_frame is actually the frame data
             buf = self_or_frame
+            
+            # Check if stream_buffer is available
+            if stream_buffer is None:
+                logger.error(f"[CRITICAL_DEBUG] {call_time} ERROR: stream_buffer is None!")
+                logger.error(f"[CRITICAL_DEBUG] {call_time} Cannot process PiCamera2 frame - no stream buffer!")
+                # We need to return something - use original method if possible
+                if original_write_method:
+                    logger.error(f"[CRITICAL_DEBUG] {call_time} Falling back to original_write_method")
+                    # This will likely fail without proper 'self'
+                    return original_write_method(buf)
+                return len(buf)  # Last resort fallback
+                
+            # Verify stream_buffer has _original_write
+            if not hasattr(stream_buffer, '_original_write'):
+                logger.error(f"[CRITICAL_DEBUG] {call_time} ERROR: stream_buffer missing _original_write attribute!")
+                logger.error(f"[CRITICAL_DEBUG] {call_time} stream_buffer attributes: {dir(stream_buffer)}")
+                # Try original method as fallback
+                logger.error(f"[CRITICAL_DEBUG] {call_time} Falling back to original method")
+                if original_write_method:
+                    return original_write_method(stream_buffer, buf)
+                return len(buf)  # Last resort fallback
+                
             # Use the saved original method from the stream buffer instance (from FastAPI)
+            logger.debug(f"[CRITICAL_DEBUG] {call_time} Calling stream_buffer._original_write")
             result = stream_buffer._original_write(buf)
             
+        # Add detailed frame processing logging
+        call_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
         try:
             # Now process the frame using the stream_buffer (the actual FastAPI FrameBuffer)
-            if stream_buffer and hasattr(stream_buffer, 'raw_frame') and stream_buffer.raw_frame is not None:
-                # Add the frame to our CircularFrameBuffer for motion detection
-                frame_buffer.add_frame(stream_buffer.raw_frame.copy(), datetime.datetime.now())
+            if stream_buffer is None:
+                logger.error(f"[CRITICAL_DEBUG] {call_time} Cannot process frame - stream_buffer is None")
+            elif not hasattr(stream_buffer, 'raw_frame'):
+                logger.error(f"[CRITICAL_DEBUG] {call_time} stream_buffer missing raw_frame attribute")
+                logger.error(f"[CRITICAL_DEBUG] {call_time} stream_buffer attributes: {dir(stream_buffer)}")
+            elif stream_buffer.raw_frame is None:
+                logger.error(f"[CRITICAL_DEBUG] {call_time} stream_buffer.raw_frame is None")
+            else:
+                # Log successful frame acquisition
+                logger.debug(f"[CRITICAL_DEBUG] {call_time} Got valid raw_frame from stream_buffer")
+                logger.debug(f"[CRITICAL_DEBUG] {call_time} Frame shape: {stream_buffer.raw_frame.shape}")
                 
-                # Handle motion recording if motion is detected
-                if motion_detected:
-                    if not motion_recorder.recording:
-                        motion_recorder.start_recording(motion_regions)
-                    motion_recorder.add_frame(stream_buffer.raw_frame.copy(), motion_regions)
-                elif motion_recorder.recording:
-                    motion_recorder.stop_recording()
+                # Check frame_buffer (CircularFrameBuffer) exists
+                if frame_buffer is None:
+                    logger.error(f"[CRITICAL_DEBUG] {call_time} CircularFrameBuffer (frame_buffer) is None!")
+                else:
+                    # Log CircularFrameBuffer status before adding frame
+                    if hasattr(frame_buffer, 'buffer'):
+                        buffer_size = len(frame_buffer.buffer) if hasattr(frame_buffer.buffer, '__len__') else 'unknown'
+                        logger.debug(f"[CRITICAL_DEBUG] {call_time} CircularFrameBuffer size before add: {buffer_size}")
+                    
+                    # Add the frame to our CircularFrameBuffer for motion detection
+                    logger.debug(f"[CRITICAL_DEBUG] {call_time} Adding frame to CircularFrameBuffer")
+                    frame_buffer.add_frame(stream_buffer.raw_frame.copy(), datetime.datetime.now())
+                    logger.debug(f"[CRITICAL_DEBUG] {call_time} Added frame to CircularFrameBuffer successfully")
+                    
+                    # Handle motion recording if motion is detected
+                    if motion_detected:
+                        logger.debug(f"[CRITICAL_DEBUG] {call_time} Motion detected, regions: {len(motion_regions)}")
+                        if not motion_recorder.recording:
+                            logger.debug(f"[CRITICAL_DEBUG] {call_time} Starting motion recording")
+                            motion_recorder.start_recording(motion_regions)
+                        logger.debug(f"[CRITICAL_DEBUG] {call_time} Adding frame to active motion recording")
+                        motion_recorder.add_frame(stream_buffer.raw_frame.copy(), motion_regions)
+                    elif motion_recorder.recording:
+                        logger.debug(f"[CRITICAL_DEBUG] {call_time} No motion detected, stopping recording")
+                        motion_recorder.stop_recording()
         except Exception as e:
-            logger.error(f"Error in frame buffer integration: {e}")
+            logger.error(f"[CRITICAL_DEBUG] {call_time} Error in frame buffer integration: {e}")
+            # Add stack trace for detailed error info
+            import traceback
+            logger.error(f"[CRITICAL_DEBUG] {call_time} Error traceback: {traceback.format_exc()}")
+            # Also log the state of relevant objects
+            logger.error(f"[CRITICAL_DEBUG] {call_time} stream_buffer exists: {stream_buffer is not None}")
+            logger.error(f"[CRITICAL_DEBUG] {call_time} frame_buffer exists: {frame_buffer is not None}")
+            logger.error(f"[CRITICAL_DEBUG] {call_time} motion_recorder exists: {motion_recorder is not None}")
             
         return result
         
