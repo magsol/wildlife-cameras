@@ -1,10 +1,23 @@
 """
 Integration code for optical flow analysis with the existing motion detection system.
 This file demonstrates how to integrate the optical flow analyzer with the existing
-fastapi_mjpeg_server_with_storage.py file.
+fastapi_mjpeg_server_with_storage.py and motion_storage.py files.
 
 This is not a standalone file but rather shows the key sections that would need
 to be modified in the existing code.
+
+IMPORTANT NOTES:
+1. The actual FrameBuffer class inherits from io.BufferedIOBase for PiCamera2 compatibility
+2. The actual MotionEventRecorder uses threading and a queue-based event processing system
+3. Flow features need to be passed from FrameBuffer.write() to MotionEventRecorder
+   - Option A: Use a module-level variable (simple but not ideal for threading)
+   - Option B: Add flow features to the event queue (better threading model)
+   - Option C: Pass via circular buffer alongside frames (cleanest design)
+4. Performance optimizations are critical for Raspberry Pi:
+   - Frame skipping (process every Nth frame)
+   - Resolution downscaling for flow computation
+   - Disable real-time classification during recording (do it at end instead)
+5. The metadata.json structure needs extension to include motion_analysis section
 """
 
 # Import section additions
@@ -29,43 +42,42 @@ optical_flow_analyzer = None
 motion_pattern_db = None
 
 # Configuration class updates
+# NOTE: These parameters need to be added to the existing CameraConfig and StorageConfig classes
 
-class MotionConfig(BaseModel):
-    # Existing parameters
-    motion_detection: bool = True
-    motion_threshold: int = 25
-    motion_min_area: int = 500
-    motion_mask_enabled: bool = False
-    motion_mask_points: List[List[int]] = []
-    motion_history_size: int = 10
-    motion_cooldown_seconds: int = 2
-    
+# Add to CameraConfig in fastapi_mjpeg_server_with_storage.py:
+"""
+class CameraConfig:
+    # ... existing parameters ...
+
     # New parameters for optical flow analysis
     optical_flow_enabled: bool = True
     optical_flow_feature_max: int = 100
     optical_flow_min_distance: int = 7
+    optical_flow_quality_level: float = 0.3
     optical_flow_grid_size: Tuple[int, int] = (8, 8)
     optical_flow_direction_bins: int = 8
-    optical_flow_visualization: bool = True
+    optical_flow_visualization: bool = False  # Expensive, disable by default
+    optical_flow_frame_skip: int = 2  # Process every Nth frame for performance
+"""
 
-class StorageConfig(BaseModel):
-    # Existing parameters
-    local_storage_enabled: bool = True
-    local_storage_path: str = "storage"
-    max_event_duration_sec: int = 30
-    min_motion_duration_sec: int = 3
-    pre_motion_sec: int = 2
-    post_motion_sec: int = 2
-    
+# Add to StorageConfig in motion_storage.py:
+"""
+class StorageConfig:
+    # ... existing parameters ...
+
     # New parameters for optical flow storage
     store_optical_flow_data: bool = True
     optical_flow_signature_dir: str = "flow_signatures"
     optical_flow_database_path: str = "motion_patterns.db"
-    
+
     # Motion classification parameters
     motion_classification_enabled: bool = True
     min_classification_confidence: float = 0.5
     save_flow_visualizations: bool = True
+
+    # Performance optimization
+    optical_flow_max_resolution: Tuple[int, int] = (320, 240)  # Downscale for flow computation
+"""
 
 # Lifespan function update
 
@@ -73,371 +85,356 @@ class StorageConfig(BaseModel):
 async def lifespan(app: FastAPI):
     """Initialize and cleanup resources when the application starts and stops."""
     global optical_flow_analyzer, motion_pattern_db
-    
+
     try:
         # Existing initialization code
         # ...
-        
+
         # Initialize optical flow analyzer and database
-        if storage_config.motion_classification_enabled:
+        # NOTE: Get storage_config from motion_storage module after initialization
+        if hasattr(storage_config, 'motion_classification_enabled') and storage_config.motion_classification_enabled:
             logger.info("Initializing optical flow analyzer")
-            
+
             # Create optical flow configuration
             flow_config = {
                 'feature_params': {
                     'maxCorners': camera_config.optical_flow_feature_max,
-                    'qualityLevel': 0.3,
+                    'qualityLevel': camera_config.optical_flow_quality_level,
                     'minDistance': camera_config.optical_flow_min_distance,
                     'blockSize': 7
                 },
                 'grid_size': camera_config.optical_flow_grid_size,
-                'direction_bins': camera_config.optical_flow_direction_bins
+                'direction_bins': camera_config.optical_flow_direction_bins,
+                'frame_history': 10,  # Keep last 10 frames for signature generation
             }
-            
+
             optical_flow_analyzer = OpticalFlowAnalyzer(config=flow_config)
-            
+
             # Create signature directory if it doesn't exist
-            os.makedirs(os.path.join(storage_config.local_storage_path, 
-                                     storage_config.optical_flow_signature_dir), 
-                        exist_ok=True)
-            
-            # Initialize motion pattern database
-            db_path = os.path.join(storage_config.local_storage_path, 
-                                  storage_config.optical_flow_database_path)
-            signature_dir = os.path.join(storage_config.local_storage_path, 
+            signature_dir = os.path.join(storage_config.local_storage_path,
                                         storage_config.optical_flow_signature_dir)
-            
-            motion_pattern_db = MotionPatternDatabase(db_path=db_path, 
+            os.makedirs(signature_dir, exist_ok=True)
+
+            # Initialize motion pattern database
+            db_path = os.path.join(storage_config.local_storage_path,
+                                  storage_config.optical_flow_database_path)
+
+            motion_pattern_db = MotionPatternDatabase(db_path=db_path,
                                                      signature_dir=signature_dir)
-            
-            logger.info("Optical flow analyzer and database initialized")
-        
+
+            logger.info(f"Optical flow analyzer initialized with config: {flow_config}")
+            logger.info(f"Motion pattern database at: {db_path}")
+
         yield
-        
+
+        # Cleanup optical flow resources
+        if optical_flow_analyzer is not None:
+            logger.info("Cleaning up optical flow analyzer")
+            optical_flow_analyzer.reset()
+
         # Existing cleanup code
         # ...
-        
+
     except Exception as e:
         logger.error(f"Error in lifespan: {e}")
         raise
     finally:
         # Cleanup resources
-        # ...
         pass
 
 # Modified detect_motion function
 
-def detect_motion(frame, prev_frame=None):
+def detect_motion(frame, prev_frame=None, frame_index=0):
     """
     Detect motion in a frame using background subtraction and optical flow.
-    
+
     Args:
-        frame: Current frame
-        prev_frame: Previous frame (optional)
-        
+        frame: Current frame (BGR or grayscale)
+        prev_frame: Previous frame for optical flow (BGR, optional)
+        frame_index: Frame counter for frame skipping (optional)
+
     Returns:
         Tuple of (motion_detected, regions, flow_features)
     """
     global prev_motion_frame, optical_flow_analyzer
-    
-    # Convert frame to grayscale if it's not already
+
+    # Convert frame to grayscale for motion detection
     if len(frame.shape) == 3:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     else:
         gray = frame
-    
+
+    # Apply gaussian blur as per existing implementation
+    blur_kernel = camera_config.motion_blur if camera_config.motion_blur % 2 == 1 else camera_config.motion_blur + 1
+    gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+
     # Initialize previous frame if needed
     if prev_motion_frame is None:
         prev_motion_frame = gray.copy()
         return False, [], None
-    
+
     # Compute absolute difference between current and previous frame
     frame_delta = cv2.absdiff(prev_motion_frame, gray)
-    
+
     # Apply threshold to highlight differences
     thresh = cv2.threshold(frame_delta, camera_config.motion_threshold, 255, cv2.THRESH_BINARY)[1]
-    
+
     # Dilate thresholded image to fill in holes
     thresh = cv2.dilate(thresh, None, iterations=2)
-    
-    # Apply motion mask if enabled
-    if camera_config.motion_mask_enabled and len(camera_config.motion_mask_points) > 0:
-        # Create mask from points
-        mask = np.zeros_like(thresh)
-        points = np.array(camera_config.motion_mask_points)
-        cv2.fillPoly(mask, [points], 255)
-        # Apply mask
-        thresh = cv2.bitwise_and(thresh, thresh, mask=mask)
-    
+
     # Find contours on thresholded image
     contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
+
     # Initialize motion regions
     regions = []
     motion_detected = False
-    
+
     # Process contours
     for c in contours:
         # Filter out small contours
         if cv2.contourArea(c) < camera_config.motion_min_area:
             continue
-        
+
         # Get bounding rectangle
         x, y, w, h = cv2.boundingRect(c)
         regions.append((x, y, w, h))
         motion_detected = True
-    
+
     # Update the previous frame
     prev_motion_frame = gray.copy()
-    
+
     # Initialize flow features
     flow_features = None
-    
+
     # If motion is detected and optical flow is enabled, calculate optical flow
-    if motion_detected and camera_config.optical_flow_enabled and optical_flow_analyzer is not None:
-        if prev_frame is not None:
-            flow_features = optical_flow_analyzer.extract_flow(prev_frame, frame, regions)
-    
+    # Skip frames for performance (process every Nth frame)
+    should_process_flow = (
+        motion_detected and
+        camera_config.optical_flow_enabled and
+        optical_flow_analyzer is not None and
+        prev_frame is not None and
+        (frame_index % camera_config.optical_flow_frame_skip == 0)
+    )
+
+    if should_process_flow:
+        try:
+            # Optionally downscale for performance
+            if hasattr(storage_config, 'optical_flow_max_resolution'):
+                max_w, max_h = storage_config.optical_flow_max_resolution
+                h, w = frame.shape[:2]
+                if w > max_w or h > max_h:
+                    scale = min(max_w / w, max_h / h)
+                    new_w, new_h = int(w * scale), int(h * scale)
+                    frame_scaled = cv2.resize(frame, (new_w, new_h))
+                    prev_frame_scaled = cv2.resize(prev_frame, (new_w, new_h))
+
+                    # Scale regions to match downscaled frame
+                    regions_scaled = [(int(x*scale), int(y*scale), int(w*scale), int(h*scale))
+                                     for x, y, w, h in regions]
+
+                    flow_features = optical_flow_analyzer.extract_flow(
+                        prev_frame_scaled, frame_scaled, regions_scaled)
+                else:
+                    flow_features = optical_flow_analyzer.extract_flow(prev_frame, frame, regions)
+            else:
+                flow_features = optical_flow_analyzer.extract_flow(prev_frame, frame, regions)
+
+        except Exception as e:
+            logger.error(f"Error extracting optical flow: {e}")
+            flow_features = None
+
     return motion_detected, regions, flow_features
 
 # Add optical flow support to the FrameBuffer class
+# NOTE: The actual FrameBuffer class inherits from io.BufferedIOBase and has a different structure
+# This is a simplified illustration showing the key changes needed
 
-class FrameBuffer:
-    """Buffer for frame data using a temporary file."""
-    
-    def __init__(self, app_state):
-        """Initialize the frame buffer."""
-        self.buffer = tempfile.NamedTemporaryFile(suffix='.jpg')
-        self.lock = threading.Lock()
-        self.app_state = app_state
-        self.frame_count = 0
+"""
+In fastapi_mjpeg_server_with_storage.py, modify FrameBuffer.write() method:
+
+class FrameBuffer(io.BufferedIOBase):
+    def __init__(self, max_size: int = 5):
+        super().__init__()
+        # ... existing initialization ...
         self.last_frame = None  # Store last frame for optical flow analysis
-    
+        self.frame_index = 0  # Track frame number for skip logic
+
     def write(self, buf, *args, **kwargs):
-        """Write frame data to buffer."""
-        with self.lock:
-            # Existing code
-            self.buffer.seek(0)
-            self.buffer.write(buf)
-            self.buffer.truncate()
-            self.buffer.flush()
-            
-            # Update frame in app state
-            self.buffer.seek(0)
-            raw_img = read_image_data(self.buffer.read())
-            self.app_state["last_frame"] = raw_img
-            self.buffer.seek(0)
-            
-            # Process frame for motion detection if enabled
-            if camera_config.motion_detection and raw_img is not None:
-                # Store previous frame for optical flow
-                prev_frame = self.last_frame
-                self.last_frame = raw_img.copy()
-                
-                # Detect motion with optical flow
-                motion_detected, motion_regions, flow_features = detect_motion(raw_img, prev_frame)
-                
-                # If motion detected, add to app state
-                if motion_detected:
-                    motion_time = datetime.datetime.now()
-                    
-                    # If we have flow features, add classification
-                    classification = None
-                    if flow_features and optical_flow_analyzer:
-                        # Generate signature from current flow features
-                        signature = optical_flow_analyzer.generate_motion_signature([flow_features])
-                        if signature:
-                            # Get classification
-                            classification = optical_flow_analyzer.classify_motion(signature)
-                    
-                    # Add motion event with classification
-                    motion_history.append((motion_time, motion_regions, classification))
-                    
-                    # Trim history if needed
-                    if len(motion_history) > camera_config.motion_history_size * 2:
-                        motion_history = motion_history[-camera_config.motion_history_size * 2:]
-                    
-                    # Log motion detection with classification
-                    contour_areas = [cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= camera_config.motion_min_area]
-                    if classification:
-                        logger.info(f"Motion detected! Regions: {len(motion_regions)}, "
-                                   f"Classification: {classification['label']} "
-                                   f"({classification['confidence']:.2f})")
-                    else:
-                        logger.info(f"Motion detected! Regions: {len(motion_regions)}")
-            
-            # Return number of bytes written
-            return len(buf)
+        global prev_frame, motion_detected, motion_regions, optical_flow_analyzer
+
+        # ... existing JPEG encoding code ...
+
+        # Decode JPEG to numpy array for processing
+        if camera_config.motion_detection and raw_img is not None:
+            # Store previous frame for optical flow
+            prev_frame_for_flow = self.last_frame
+            self.last_frame = raw_img.copy()
+            self.frame_index += 1
+
+            # Detect motion with optical flow
+            motion_detected, motion_regions, flow_features = detect_motion(
+                raw_img, prev_frame_for_flow, self.frame_index)
+
+            # If motion detected, add to history
+            if motion_detected:
+                motion_time = datetime.datetime.now()
+
+                # Generate real-time classification (optional, expensive)
+                # Only do this if we have enough flow history
+                classification = None
+                if (flow_features and optical_flow_analyzer and
+                    camera_config.optical_flow_visualization):
+                    try:
+                        # Only generate signature if we have enough history
+                        if len(optical_flow_analyzer.flow_history) >= 3:
+                            signature = optical_flow_analyzer.generate_motion_signature()
+                            if signature:
+                                classification = optical_flow_analyzer.classify_motion(signature)
+                    except Exception as e:
+                        logger.error(f"Error generating real-time classification: {e}")
+
+                # Add motion event with optional classification
+                motion_history.append((motion_time, motion_regions, classification))
+
+                # Trim history if needed
+                if len(motion_history) > camera_config.motion_history_size * 2:
+                    motion_history = motion_history[-camera_config.motion_history_size * 2:]
+
+                # Log motion detection
+                if classification:
+                    logger.info(f"Motion detected! Regions: {len(motion_regions)}, "
+                               f"Classification: {classification['label']} "
+                               f"({classification['confidence']:.2f})")
+                else:
+                    logger.info(f"Motion detected! Regions: {len(motion_regions)}")
+
+                # Store flow features in motion_storage module for recorder
+                # This will be picked up by MotionEventRecorder
+                if flow_features:
+                    # Store in a global or pass to recorder
+                    # Details depend on the threading model
+
+        # ... rest of existing write() method ...
+        return len(buf)
+"""
 
 # Update MotionEventRecorder in motion_storage.py
+# NOTE: The actual MotionEventRecorder has a different signature and uses threading
+# Here's what needs to be added:
+
+"""
+In motion_storage.py, modify MotionEventRecorder class:
 
 class MotionEventRecorder:
-    """Records motion events to disk."""
+    def __init__(self, frame_buffer, config):
+        # ... existing initialization ...
+        self.flow_features_list = []  # NEW: Store flow features during recording
+
+    def start_recording(self, motion_regions):
+        # Note: Current signature doesn't take flow_features parameter
+        # Flow features will be collected during add_frame() calls
+
+        if self.recording:
+            logger.debug(f"Already recording motion - ignoring start_recording call")
+            return
+
+        # ... existing event initialization ...
+
+        # NEW: Reset flow features for this event
+        self.flow_features_list = []
+
+        # Reset optical flow analyzer history for new event
+        if optical_flow_analyzer is not None:
+            optical_flow_analyzer.reset()
+
+        logger.info(f"Started recording motion event {event_id}")
+"""
     
-    def __init__(self, config, circular_buffer):
-        self.config = config
-        self.buffer = circular_buffer
-        self.current_event = None
-        self.recording = False
-        self.lock = threading.Lock()
-        self.flow_features = []  # Store flow features during recording
+"""
+    def add_frame(self, frame, timestamp):
+        # Note: Current signature only takes frame and timestamp
+        # Flow features need to be collected differently
+
+        # ... existing frame recording logic ...
+
+        # NEW: Collect flow features if available
+        # Option: Store flow features alongside frames in a parallel structure
+        # Or: Access global flow features that were computed during motion detection
+"""
     
-    def start_recording(self, motion_regions, flow_features=None):
-        """Start recording a new motion event."""
-        with self.lock:
-            if self.recording:
-                return
-                
-            # Generate event ID
-            event_time = datetime.now()
-            event_id = f"motion_{event_time.strftime('%Y%m%d_%H%M%S_%f')[:-3]}"
-            
-            # Create event directory
-            event_dir = os.path.join(self.config.local_storage_path, event_id)
-            os.makedirs(event_dir, exist_ok=True)
-            
-            # Create thumbnails directory
-            thumb_dir = os.path.join(event_dir, "thumbnails")
-            os.makedirs(thumb_dir, exist_ok=True)
-            
-            # Initialize event metadata
-            self.current_event = {
-                "id": event_id,
-                "start_time": event_time.isoformat(),
-                "regions": motion_regions,
-                "frames": [],
-                "path": event_dir,
-                "thumbnails_path": thumb_dir,
-                "flow_features": []  # Store flow features
-            }
-            
-            # Reset flow features
-            self.flow_features = []
-            if flow_features:
-                self.flow_features.append(flow_features)
-            
-            # Set recording flag
-            self.recording = True
-            
-            logger.info(f"Started recording motion event {event_id}")
-            
-            # Create video writer
-            self._create_video_writer(event_dir, event_id)
-            
-            # Save first frame as thumbnail
-            self._save_thumbnail(0)
-    
-    def add_frame(self, frame, motion_regions=None, flow_features=None):
-        """Add a frame to the current recording."""
-        with self.lock:
-            if not self.recording or self.current_event is None:
-                return
-                
-            # Add frame to video
-            if self.writer is not None and frame is not None:
-                self.writer.write(frame)
-                
-            # Add flow features if provided
-            if flow_features:
-                self.flow_features.append(flow_features)
-                
-            # Update regions if provided
-            if motion_regions:
-                self.current_event["regions"] = motion_regions
-                
-            # Add frame to event
-            frame_time = datetime.now()
-            self.current_event["frames"].append({
-                "timestamp": frame_time.isoformat(),
-                "has_motion": motion_regions is not None and len(motion_regions) > 0
-            })
-            
-            # Save thumbnail periodically
-            if len(self.current_event["frames"]) % 30 == 0:
-                self._save_thumbnail(len(self.current_event["frames"]) // 30)
-    
+"""
     def stop_recording(self):
-        """Stop the current recording."""
-        with self.lock:
-            if not self.recording or self.current_event is None:
-                return
-                
-            # Release video writer
-            if self.writer is not None:
-                self.writer.release()
-                self.writer = None
-                
-            # Calculate duration
-            end_time = datetime.now()
-            start_time = datetime.fromisoformat(self.current_event["start_time"])
-            duration = (end_time - start_time).total_seconds()
-            
-            # Update event metadata
-            self.current_event["end_time"] = end_time.isoformat()
-            self.current_event["duration"] = duration
-            
-            # Process optical flow data if available
-            motion_classification = None
-            if self.flow_features and len(self.flow_features) > 0 and optical_flow_analyzer is not None:
-                try:
-                    # Generate motion signature
-                    motion_signature = optical_flow_analyzer.generate_motion_signature(self.flow_features)
-                    
-                    if motion_signature:
-                        # Classify motion
-                        motion_classification = optical_flow_analyzer.classify_motion(motion_signature)
-                        
-                        # Save flow signature
-                        if storage_config.store_optical_flow_data and motion_pattern_db is not None:
-                            # Save to database
-                            motion_pattern_db.add_pattern(
-                                self.current_event["id"],
-                                motion_signature,
-                                motion_classification,
-                                {
-                                    "event_id": self.current_event["id"],
-                                    "duration": duration,
-                                    "time_of_day": start_time.hour,
-                                    "frame_count": len(self.current_event["frames"])
-                                }
-                            )
-                        
-                        # Save flow visualization if enabled
-                        if storage_config.save_flow_visualizations and len(self.flow_features) > 0:
-                            # Create a visualization of the motion
-                            last_frame = self.buffer.get_frame(0)  # Get latest frame
-                            if last_frame is not None and self.flow_features[-1] is not None:
-                                flow_vis = optical_flow_analyzer.visualize_flow(
-                                    last_frame, self.flow_features[-1])
-                                
-                                # Save visualization
-                                flow_vis_path = os.path.join(self.current_event["path"], "flow.jpg")
-                                cv2.imwrite(flow_vis_path, flow_vis)
-                except Exception as e:
-                    logger.error(f"Error processing optical flow data: {e}")
-            
-            # Add motion classification to metadata
-            if motion_classification:
-                self.current_event["motion_classification"] = motion_classification
-                
-                # Log classification result
-                label = motion_classification["label"]
-                confidence = motion_classification["confidence"]
-                logger.info(f"Motion event {self.current_event['id']} classified as: "
-                          f"{label} ({confidence:.2f})")
-            
-            # Save metadata
-            metadata_path = os.path.join(self.current_event["path"], "metadata.json")
-            with open(metadata_path, "w") as f:
-                json.dump(self.current_event, f, indent=2)
-                
-            # Reset state
-            event_id = self.current_event["id"]
-            self.current_event = None
-            self.recording = False
-            self.flow_features = []
-            
-            logger.info(f"Stopped recording motion event {event_id}")
+        # ... existing stop recording logic ...
+
+        # NEW: Process optical flow data if available
+        motion_classification = None
+        motion_signature = None
+
+        if optical_flow_analyzer is not None:
+            try:
+                # Generate motion signature from accumulated flow history
+                # The analyzer has been collecting flow features during the event
+                motion_signature = optical_flow_analyzer.generate_motion_signature()
+
+                if motion_signature:
+                    # Classify the motion pattern
+                    motion_classification = optical_flow_analyzer.classify_motion(motion_signature)
+
+                    # Save to pattern database if enabled
+                    if (storage_config.store_optical_flow_data and
+                        motion_pattern_db is not None and
+                        motion_classification['confidence'] >= storage_config.min_classification_confidence):
+
+                        motion_pattern_db.add_pattern(
+                            self.current_event["id"],
+                            motion_signature,
+                            motion_classification,
+                            {
+                                "event_id": self.current_event["id"],
+                                "duration": duration,
+                                "time_of_day": start_time.hour,
+                                "frame_count": len(self.current_event["frames"])
+                            }
+                        )
+
+                    # Save flow visualization if enabled
+                    if storage_config.save_flow_visualizations:
+                        # Get a representative frame from the buffer
+                        recent_frames = self.frame_buffer.get_recent_frames(seconds=1)
+                        if recent_frames and len(optical_flow_analyzer.flow_history) > 0:
+                            frame, _ = recent_frames[-1]
+                            last_flow = optical_flow_analyzer.flow_history[-1]
+
+                            # Generate visualization
+                            flow_vis = optical_flow_analyzer.visualize_flow(frame, last_flow)
+
+                            # Save to event directory
+                            flow_vis_path = os.path.join(event_dir, "flow_visualization.jpg")
+                            cv2.imwrite(flow_vis_path, flow_vis)
+
+                    # Log classification
+                    logger.info(f"Motion event {event_id} classified as: "
+                              f"{motion_classification['label']} "
+                              f"(confidence: {motion_classification['confidence']:.2f})")
+
+            except Exception as e:
+                logger.error(f"Error processing optical flow data: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+        # NEW: Add motion_analysis section to metadata
+        if motion_classification:
+            self.current_event["motion_analysis"] = {
+                "classification": motion_classification,
+                "motion_characteristics": motion_signature.get('statistical_features', {}),
+                "temporal_features": motion_signature.get('temporal_features', {}),
+                "signature_hash": hashlib.md5(
+                    motion_signature['histogram_features'].tobytes()
+                ).hexdigest() if motion_signature else None
+            }
+
+        # ... existing metadata saving and cleanup ...
+"""
 
 # Update motion status API endpoint
 
@@ -883,4 +880,63 @@ HTML_TEMPLATE = """
     </script>
 </body>
 </html>
+"""
+
+# ============================================================================
+# INTEGRATION SUMMARY
+# ============================================================================
+"""
+To integrate optical flow motion classification, the following changes are needed:
+
+1. CONFIGURATION CHANGES:
+   - Add optical flow parameters to CameraConfig dataclass
+   - Add optical flow storage parameters to StorageConfig dataclass
+
+2. INITIALIZATION CHANGES (in lifespan function):
+   - Create OpticalFlowAnalyzer instance with configuration
+   - Create MotionPatternDatabase instance
+   - Initialize storage directories
+
+3. MOTION DETECTION CHANGES:
+   - Update detect_motion() to accept prev_frame and frame_index
+   - Add optical flow extraction when motion is detected
+   - Implement frame skipping for performance
+   - Implement resolution downscaling for flow computation
+
+4. FRAME BUFFER CHANGES:
+   - Add last_frame and frame_index tracking
+   - Pass previous frame to detect_motion()
+   - Optionally generate real-time classification for display
+
+5. MOTION EVENT RECORDER CHANGES:
+   - Add flow_features_list to track flow during recording
+   - Reset analyzer when starting new recording
+   - Generate signature and classify at end of recording
+   - Save signature to database
+   - Save flow visualization image
+   - Add motion_analysis to metadata.json
+
+6. API ENDPOINT CHANGES:
+   - Update /motion_status to include classification
+   - Add endpoints for pattern browsing (Phase 3)
+   - Add endpoints for user feedback (Phase 3)
+
+7. UI CHANGES:
+   - Display classification labels in real-time
+   - Show confidence bars
+   - Display flow visualizations in event history
+   - Add pattern management tab (Phase 3)
+
+PERFORMANCE CONSIDERATIONS:
+- Process optical flow every 2-3 frames, not every frame
+- Downscale to 320x240 for flow computation
+- Disable real-time classification unless needed for display
+- Do full signature generation and classification only at event end
+- Use threading to avoid blocking camera pipeline
+
+THREADING MODEL:
+- FrameBuffer.write() runs in camera thread
+- Optical flow extraction should be fast (< 10ms target)
+- Heavy processing (signature, classification) should be in recorder thread
+- Pattern database has its own locking for thread safety
 """

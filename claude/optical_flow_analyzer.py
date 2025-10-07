@@ -208,8 +208,10 @@ class OpticalFlowAnalyzer:
             )
             
             # Filter out points where flow wasn't found
-            good_new = next_features[status == 1]
-            good_old = self.prev_features[status == 1]
+            # status is (N,) but features are (N, 1, 2), so we need to reshape
+            status_flat = status.ravel()
+            good_new = next_features[status_flat == 1]
+            good_old = self.prev_features[status_flat == 1]
             
             # Calculate flow vectors
             flow_vectors = []
@@ -608,16 +610,16 @@ class MotionPatternDatabase:
         """
         self.db_path = db_path
         self.signature_dir = signature_dir
-        
+
+        # Lock for thread safety (must be initialized before _init_database)
+        self.lock = threading.Lock()
+
         # Create signature directory if it doesn't exist
         os.makedirs(self.signature_dir, exist_ok=True)
-        
+
         # Initialize database
         self._init_database()
-        
-        # Lock for thread safety
-        self.lock = threading.Lock()
-        
+
         logger.info("MotionPatternDatabase initialized at %s", db_path)
 
     def _init_database(self):
@@ -740,14 +742,30 @@ class MotionPatternDatabase:
                     
                 # Load numpy file
                 signature_data = np.load(signature_path, allow_pickle=True)
-                
+
                 # Reconstruct motion signature
+                # Handle both string and numpy scalar types
+                stats_str = signature_data['stats']
+                temporal_str = signature_data['temporal']
+                timestamp_val = signature_data['timestamp']
+                frame_count_val = signature_data['frame_count']
+
+                # Convert numpy types to Python types
+                if isinstance(stats_str, np.ndarray):
+                    stats_str = stats_str.item()
+                if isinstance(temporal_str, np.ndarray):
+                    temporal_str = temporal_str.item()
+                if isinstance(timestamp_val, np.ndarray):
+                    timestamp_val = timestamp_val.item()
+                if isinstance(frame_count_val, np.ndarray):
+                    frame_count_val = frame_count_val.item()
+
                 motion_signature = {
                     'histogram_features': signature_data['histogram'],
-                    'statistical_features': json.loads(signature_data['stats']),
-                    'temporal_features': json.loads(signature_data['temporal']),
-                    'timestamp': signature_data['timestamp'],
-                    'frame_count': signature_data['frame_count']
+                    'statistical_features': json.loads(str(stats_str)),
+                    'temporal_features': json.loads(str(temporal_str)),
+                    'timestamp': str(timestamp_val),
+                    'frame_count': int(frame_count_val)
                 }
                 
                 # Create pattern dictionary
@@ -767,20 +785,95 @@ class MotionPatternDatabase:
                 logger.error("Error retrieving pattern from database: %s", e)
                 return None
 
-    def find_similar_patterns(self, motion_signature, limit=5):
+    def find_similar_patterns(self, motion_signature, limit=5, similarity_threshold=0.7):
         """
-        Find patterns similar to the given motion signature.
-        
+        Find patterns similar to the given motion signature using cosine similarity.
+
         Args:
             motion_signature: Motion signature to compare against
             limit: Maximum number of results to return
-            
+            similarity_threshold: Minimum similarity score (0-1)
+
         Returns:
-            List of similar patterns with similarity scores
+            List of similar patterns with similarity scores, sorted by descending similarity
         """
-        # This is a placeholder - full implementation would use similarity metrics
-        # to find and return the most similar patterns in the database
-        return []
+        if not motion_signature or 'histogram_features' not in motion_signature:
+            return []
+
+        # Get all patterns from database
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT id as pattern_id, signature_path FROM motion_patterns')
+        all_patterns = cursor.fetchall()
+
+        if not all_patterns:
+            return []
+
+        # Extract query histogram
+        query_histogram = motion_signature['histogram_features'].flatten()
+
+        # Calculate similarity scores
+        similarities = []
+        for pattern_id, signature_path in all_patterns:
+            try:
+                # Load the stored signature
+                stored_signature = np.load(signature_path, allow_pickle=True)
+                stored_histogram = stored_signature['histogram_features'].flatten()
+
+                # Compute cosine similarity
+                similarity = self._cosine_similarity(query_histogram, stored_histogram)
+
+                if similarity >= similarity_threshold:
+                    similarities.append((pattern_id, similarity))
+
+            except Exception as e:
+                logger.error(f"Error comparing pattern {pattern_id}: {e}")
+                continue
+
+        # Sort by similarity (descending) and return top matches
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        results = []
+
+        for pattern_id, similarity in similarities[:limit]:
+            # Get pattern metadata
+            cursor.execute('''
+                SELECT classification, confidence, metadata
+                FROM patterns WHERE pattern_id = ?
+            ''', (pattern_id,))
+            row = cursor.fetchone()
+
+            if row:
+                results.append({
+                    'pattern_id': pattern_id,
+                    'similarity': float(similarity),
+                    'classification': row[0],
+                    'confidence': row[1],
+                    'metadata': json.loads(row[2]) if row[2] else {}
+                })
+
+        conn.close()
+        return results
+
+    def _cosine_similarity(self, vec1, vec2):
+        """
+        Calculate cosine similarity between two vectors.
+
+        Args:
+            vec1: First vector
+            vec2: Second vector
+
+        Returns:
+            Similarity score between 0 and 1
+        """
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        return dot_product / (norm1 * norm2)
 
     def update_classification(self, pattern_id, classification):
         """
@@ -815,6 +908,135 @@ class MotionPatternDatabase:
             except Exception as e:
                 logger.error("Error updating classification: %s", e)
                 return False
+
+    def discover_patterns_kmeans(self, n_clusters=5):
+        """
+        Use K-Means clustering to discover motion pattern groups.
+
+        Args:
+            n_clusters: Number of clusters to find
+
+        Returns:
+            Dictionary mapping cluster labels to pattern IDs
+        """
+        try:
+            from sklearn.cluster import KMeans
+        except ImportError:
+            logger.error("scikit-learn not installed. Cannot perform clustering.")
+            return {}
+
+        # Get all patterns
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT pattern_id, signature_path FROM patterns')
+        all_patterns = cursor.fetchall()
+
+        if len(all_patterns) < n_clusters:
+            logger.warning(f"Not enough patterns ({len(all_patterns)}) for {n_clusters} clusters")
+            return {}
+
+        # Load all histograms
+        pattern_ids = []
+        feature_vectors = []
+
+        for pattern_id, signature_path in all_patterns:
+            try:
+                signature = np.load(signature_path, allow_pickle=True)
+                histogram = signature['histogram_features'].flatten()
+                pattern_ids.append(pattern_id)
+                feature_vectors.append(histogram)
+            except Exception as e:
+                logger.error(f"Error loading pattern {pattern_id}: {e}")
+                continue
+
+        if len(feature_vectors) < n_clusters:
+            logger.warning("Not enough valid patterns for clustering")
+            return {}
+
+        # Perform K-Means clustering
+        X = np.array(feature_vectors)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X)
+
+        # Group patterns by cluster
+        clusters = {}
+        for pattern_id, label in zip(pattern_ids, labels):
+            cluster_label = int(label)
+            if cluster_label not in clusters:
+                clusters[cluster_label] = []
+            clusters[cluster_label].append(pattern_id)
+
+        logger.info(f"Discovered {len(clusters)} clusters from {len(pattern_ids)} patterns")
+        for cluster_id, patterns in clusters.items():
+            logger.info(f"  Cluster {cluster_id}: {len(patterns)} patterns")
+
+        return clusters
+
+    def discover_patterns_dbscan(self, eps=0.5, min_samples=3):
+        """
+        Use DBSCAN clustering to discover motion pattern groups (handles noise better).
+
+        Args:
+            eps: Maximum distance between samples for one to be considered a neighbor
+            min_samples: Minimum number of samples in a neighborhood for a core point
+
+        Returns:
+            Dictionary mapping cluster labels to pattern IDs (-1 for noise)
+        """
+        try:
+            from sklearn.cluster import DBSCAN
+        except ImportError:
+            logger.error("scikit-learn not installed. Cannot perform clustering.")
+            return {}
+
+        # Get all patterns
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT pattern_id, signature_path FROM patterns')
+        all_patterns = cursor.fetchall()
+
+        if len(all_patterns) < min_samples:
+            logger.warning(f"Not enough patterns ({len(all_patterns)}) for DBSCAN")
+            return {}
+
+        # Load all histograms
+        pattern_ids = []
+        feature_vectors = []
+
+        for pattern_id, signature_path in all_patterns:
+            try:
+                signature = np.load(signature_path, allow_pickle=True)
+                histogram = signature['histogram_features'].flatten()
+                pattern_ids.append(pattern_id)
+                feature_vectors.append(histogram)
+            except Exception as e:
+                logger.error(f"Error loading pattern {pattern_id}: {e}")
+                continue
+
+        if len(feature_vectors) < min_samples:
+            logger.warning("Not enough valid patterns for clustering")
+            return {}
+
+        # Perform DBSCAN clustering
+        X = np.array(feature_vectors)
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine')
+        labels = dbscan.fit_predict(X)
+
+        # Group patterns by cluster
+        clusters = {}
+        for pattern_id, label in zip(pattern_ids, labels):
+            cluster_label = int(label)
+            if cluster_label not in clusters:
+                clusters[cluster_label] = []
+            clusters[cluster_label].append(pattern_id)
+
+        n_clusters = len([k for k in clusters.keys() if k != -1])
+        n_noise = len(clusters.get(-1, []))
+
+        logger.info(f"Discovered {n_clusters} clusters from {len(pattern_ids)} patterns ({n_noise} noise)")
+        for cluster_id, patterns in clusters.items():
+            cluster_type = "Noise" if cluster_id == -1 else f"Cluster {cluster_id}"
+            logger.info(f"  {cluster_type}: {len(patterns)} patterns")
+
+        return clusters
 
 
 def test_optical_flow(video_path, output_path=None):

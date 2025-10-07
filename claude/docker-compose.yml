@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # Raspberry Pi ARM64 test environment
+  rpi-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.rpi
+    platform: linux/arm64
+    volumes:
+      - .:/app
+      - ./test_data:/test_data
+      - ./test_results:/test_results
+    environment:
+      - PYTHONUNBUFFERED=1
+      - IS_RASPBERRY_PI=false  # Mock mode
+    command: python3 test_integration.py
+
+  # Development server with mock camera
+  rpi-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.rpi
+    platform: linux/arm64
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./test_data:/test_data
+      - /tmp/motion_events:/tmp/motion_events
+    environment:
+      - PYTHONUNBUFFERED=1
+      - IS_RASPBERRY_PI=false
+    command: python3 fastapi_mjpeg_server_with_storage.py --width 640 --height 480
+
+  # Full test suite runner
+  rpi-full-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.rpi
+    platform: linux/arm64
+    volumes:
+      - .:/app
+      - ./test_results:/test_results
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: >
+      sh -c "
+        echo '=== Running Unit Tests ===' &&
+        python3 -m pytest tests/test_optical_flow_analyzer.py -v &&
+        echo '=== Running Integration Tests ===' &&
+        python3 test_integration.py &&
+        echo '=== Running Import Tests ===' &&
+        python3 test_imports.py
+      "

@@ -30,6 +30,9 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Set
 
+# Import optical flow analyzer for classification
+from optical_flow_analyzer import OpticalFlowAnalyzer, MotionPatternDatabase
+
 # Helper function to detect Raspberry Pi
 def is_raspberry_pi():
     """Detect if running on a Raspberry Pi using multiple methods"""
@@ -85,36 +88,47 @@ motion_regions = []
 # Global shutdown event for signaling threads to terminate
 shutdown_requested = threading.Event()
 
+# Optical flow globals - will be set by main module
+_optical_flow_analyzer = None
+_motion_pattern_db = None
+
+def set_optical_flow_components(analyzer, pattern_db):
+    """Set optical flow analyzer and pattern database from main module"""
+    global _optical_flow_analyzer, _motion_pattern_db
+    _optical_flow_analyzer = analyzer
+    _motion_pattern_db = pattern_db
+    logger.info("Optical flow components set in motion_storage module")
+
 # Storage configuration
 @dataclass
 class StorageConfig:
     # RAM Buffer settings
     ram_buffer_seconds: int = 30       # Seconds to keep in RAM before/after motion
     max_ram_segments: int = 300        # Maximum segments in RAM (10 seconds at 30fps)
-    
+
     # Local storage settings
     local_storage_path: str = "/tmp/motion_events"
     max_disk_usage_mb: int = 1000      # 1GB max local storage
     min_motion_duration_sec: int = 3   # Minimum motion duration to save
-    
+
     # Remote storage settings
     remote_storage_url: str = "http://192.168.1.100:8080/storage"
     remote_api_key: str = "your_api_key_here"
     chunk_upload: bool = True          # Enable chunked uploads
-    
+
     # Transfer settings
     upload_throttle_kbps: int = 500    # Throttle uploads to 500 KB/s
     transfer_retry_interval_sec: int = 60
     transfer_schedule_active: bool = True
-    transfer_schedule_start: int = 1   # 1 AM 
+    transfer_schedule_start: int = 1   # 1 AM
     transfer_schedule_end: int = 5     # 5 AM
-    
+
     # Thumbnail settings
     generate_thumbnails: bool = True
     thumbnail_width: int = 320
     thumbnail_height: int = 240
     thumbnails_per_event: int = 3      # Number of thumbnails per event
-    
+
     # WiFi monitoring settings
     wifi_monitoring: bool = True
     wifi_adapter: str = "wlan0"
@@ -123,6 +137,19 @@ class StorageConfig:
     wifi_throttle_poor: int = 100      # KB/s when signal is poor
     wifi_throttle_medium: int = 300    # KB/s when signal is medium
     wifi_throttle_good: int = 800      # KB/s when signal is good
+
+    # Optical flow storage settings
+    store_optical_flow_data: bool = True
+    optical_flow_signature_dir: str = "flow_signatures"
+    optical_flow_database_path: str = "motion_patterns.db"
+
+    # Motion classification settings
+    motion_classification_enabled: bool = True
+    min_classification_confidence: float = 0.5
+    save_flow_visualizations: bool = True
+
+    # Performance optimization
+    optical_flow_max_resolution: Tuple[int, int] = (320, 240)  # Downscale for flow computation
 
 # Circular buffer for RAM storage
 class CircularFrameBuffer:
@@ -220,15 +247,20 @@ class MotionEventRecorder:
         if self.recording:
             logger.debug(f"[MOTION_FLOW] Already recording motion - ignoring start_recording call")
             return
-            
+
         start_time = datetime.datetime.now()
         event_id = self._generate_event_id()
-        
+
         # Log motion event start with high visibility
         frame_time = start_time.strftime("%H:%M:%S.%f")[:-3]
         logger.critical(f"[EVENT_STARTED] {frame_time} NEW MOTION EVENT STARTED - ID: {event_id}")
         logger.critical(f"[EVENT_STARTED] Motion regions: {len(motion_regions)}, min duration threshold: {self.config.min_motion_duration_sec}s")
-        
+
+        # Reset optical flow analyzer for new event
+        if _optical_flow_analyzer is not None:
+            _optical_flow_analyzer.reset()
+            logger.debug(f"[OPTICAL_FLOW] Analyzer reset for new event {event_id}")
+
         self.recording = True
         self.current_event = {
             "start_time": start_time,
@@ -413,6 +445,69 @@ class MotionEventRecorder:
                     thumbnails = self._generate_thumbnails(event["frames"])
                     logger.info(f"[MOTION_FLOW] {event_time} Generated {len(thumbnails)} thumbnails for event {event_id}")
                 
+                # Process optical flow if available
+                motion_classification = None
+                motion_signature = None
+
+                if _optical_flow_analyzer is not None:
+                    try:
+                        logger.info(f"[OPTICAL_FLOW] Processing optical flow for event {event['id']}")
+
+                        # Generate motion signature from accumulated flow history
+                        motion_signature = _optical_flow_analyzer.generate_motion_signature()
+
+                        if motion_signature:
+                            # Classify the motion pattern
+                            motion_classification = _optical_flow_analyzer.classify_motion(motion_signature)
+
+                            logger.info(f"[OPTICAL_FLOW] Event {event['id']} classified as: "
+                                      f"{motion_classification['label']} "
+                                      f"(confidence: {motion_classification['confidence']:.2f})")
+
+                            # Save to pattern database if enabled
+                            if (self.config.store_optical_flow_data and
+                                _motion_pattern_db is not None and
+                                motion_classification['confidence'] >= self.config.min_classification_confidence):
+
+                                _motion_pattern_db.add_pattern(
+                                    event["id"],
+                                    motion_signature,
+                                    motion_classification,
+                                    {
+                                        "event_id": event["id"],
+                                        "duration": (event["end_time"] - event["start_time"]).total_seconds(),
+                                        "time_of_day": event["start_time"].hour,
+                                        "frame_count": len(event["frames"])
+                                    }
+                                )
+                                logger.info(f"[OPTICAL_FLOW] Pattern saved to database for event {event['id']}")
+
+                            # Save flow visualization if enabled
+                            if self.config.save_flow_visualizations:
+                                try:
+                                    # Get a representative frame
+                                    if event["frames"] and len(_optical_flow_analyzer.flow_history) > 0:
+                                        frame, _ = event["frames"][-1]
+                                        last_flow = _optical_flow_analyzer.flow_history[-1]
+
+                                        # Generate visualization
+                                        flow_vis = _optical_flow_analyzer.visualize_flow(frame, last_flow)
+
+                                        # Save to event directory
+                                        flow_vis_path = os.path.join(event_dir, "flow_visualization.jpg")
+                                        cv2.imwrite(flow_vis_path, flow_vis)
+                                        logger.info(f"[OPTICAL_FLOW] Flow visualization saved for event {event['id']}")
+                                except Exception as e:
+                                    logger.error(f"[OPTICAL_FLOW] Error saving flow visualization: {e}")
+
+                        # Reset analyzer for next event
+                        _optical_flow_analyzer.reset()
+
+                    except Exception as e:
+                        logger.error(f"[OPTICAL_FLOW] Error processing optical flow: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+
                 # Save metadata
                 metadata = {
                     "id": event["id"],
@@ -428,6 +523,17 @@ class MotionEventRecorder:
                     "has_thumbnails": len(thumbnails) > 0,
                     "processed": False
                 }
+
+                # Add motion analysis if available
+                if motion_classification and motion_signature:
+                    metadata["motion_analysis"] = {
+                        "classification": motion_classification,
+                        "motion_characteristics": motion_signature.get('statistical_features', {}),
+                        "temporal_features": motion_signature.get('temporal_features', {}),
+                        "signature_hash": hashlib.md5(
+                            motion_signature['histogram_features'].tobytes()
+                        ).hexdigest() if 'histogram_features' in motion_signature else None
+                    }
                 
                 # Write metadata file
                 metadata_path = os.path.join(event_dir, "metadata.json")
@@ -1653,7 +1759,8 @@ def initialize(app=None, camera_config=None, external_storage_config=None):
         'wifi_monitor': wifi_monitor,
         'storage_config': storage_config,
         'modify_frame_buffer_write': modify_frame_buffer_write,  # Now expects an additional stream_buffer_instance parameter
-        'shutdown': shutdown  # Add the shutdown function to the returned resources
+        'shutdown': shutdown,  # Add the shutdown function to the returned resources
+        'set_optical_flow_components': set_optical_flow_components  # Export optical flow setter
     }
 
 def shutdown():

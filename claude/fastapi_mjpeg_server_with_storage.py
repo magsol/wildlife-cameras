@@ -36,6 +36,9 @@ from pydantic import BaseModel, Field, field_validator
 from motion_storage import initialize as init_motion_storage
 from motion_storage import StorageConfig
 
+# Import optical flow analyzer
+from optical_flow_analyzer import OpticalFlowAnalyzer, MotionPatternDatabase
+
 # Import picamera2 with error handling
 try:
     from picamera2 import Picamera2
@@ -73,6 +76,16 @@ class CameraConfig:
     highlight_motion: bool = True
     motion_history_size: int = 50  # Number of motion events to keep in history
 
+    # Optical flow configuration
+    optical_flow_enabled: bool = True
+    optical_flow_feature_max: int = 100
+    optical_flow_min_distance: int = 7
+    optical_flow_quality_level: float = 0.3
+    optical_flow_grid_size: Tuple[int, int] = (8, 8)
+    optical_flow_direction_bins: int = 8
+    optical_flow_visualization: bool = False  # Expensive, disable by default
+    optical_flow_frame_skip: int = 2  # Process every Nth frame for performance
+
 # Global variables
 camera_config = CameraConfig()
 active_connections: List[str] = []
@@ -83,7 +96,11 @@ shutdown_event = asyncio.Event()
 prev_frame = None
 motion_detected = False
 motion_regions = []
-motion_history = []  # List of (timestamp, region) tuples
+motion_history = []  # List of (timestamp, region, classification) tuples
+
+# Optical flow variables
+optical_flow_analyzer: Optional[OpticalFlowAnalyzer] = None
+motion_pattern_db: Optional[MotionPatternDatabase] = None
 
 # Frame buffer with thread-safe access
 class FrameBuffer(io.BufferedIOBase):
@@ -94,29 +111,38 @@ class FrameBuffer(io.BufferedIOBase):
         self.last_access_times: Dict[str, float] = {}
         self.max_size = max_size
         self.raw_frame = None  # Store the raw frame for processing
-        
+        self.last_frame = None  # Store last frame for optical flow analysis
+        self.frame_index = 0  # Track frame number for skip logic
+
     def write(self, buf, *args, **kwargs):
         """
         Write a new frame to the buffer.
-        This method accepts variadic arguments to handle both direct calls and calls 
+        This method accepts variadic arguments to handle both direct calls and calls
         from PiCamera2's FileOutput class.
         """
         global prev_frame, motion_detected, motion_regions
-        
+
         with self.condition:
             # Store the original buffer
             original_buf = buf
-            
+
             # Convert buffer to cv2 image for processing
             try:
                 # Convert buffer to numpy array
                 np_arr = np.frombuffer(buf, np.uint8)
                 raw_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 self.raw_frame = raw_img.copy()
-                
+
                 # Process frame for motion detection if enabled
                 if camera_config.motion_detection and raw_img is not None:
-                    motion_detected, motion_regions = detect_motion(raw_img)
+                    # Store previous frame for optical flow
+                    prev_frame_for_flow = self.last_frame
+                    self.last_frame = raw_img.copy()
+                    self.frame_index += 1
+
+                    # Detect motion with optical flow
+                    motion_detected, motion_regions, flow_features = detect_motion(
+                        raw_img, prev_frame_for_flow, self.frame_index)
                 
                 # Add timestamp if enabled
                 if camera_config.show_timestamp:
@@ -270,19 +296,58 @@ async def lifespan(app: FastAPI):
         # Patch the frame buffer write method
         # We need to patch it in a way that works with both direct calls and calls through PiCamera2
         original_write = frame_buffer.write
-        
+
         # Store the original write method on the instance for access by the wrapper
         frame_buffer._original_write = original_write
-        
+
         # Create the patched write method, passing our stream buffer instance explicitly
         patched_write = motion_storage['modify_frame_buffer_write'](original_write, frame_buffer)
-        
+
         # Replace the method with our patched version
         frame_buffer.write = patched_write
-        
+
         logger.info("Successfully patched frame buffer write method")
 
-        
+        # Initialize optical flow analyzer and pattern database
+        global optical_flow_analyzer, motion_pattern_db
+        if storage_config.motion_classification_enabled and camera_config.optical_flow_enabled:
+            logger.info("Initializing optical flow analyzer")
+
+            # Create optical flow configuration
+            flow_config = {
+                'feature_params': {
+                    'maxCorners': camera_config.optical_flow_feature_max,
+                    'qualityLevel': camera_config.optical_flow_quality_level,
+                    'minDistance': camera_config.optical_flow_min_distance,
+                    'blockSize': 7
+                },
+                'grid_size': camera_config.optical_flow_grid_size,
+                'direction_bins': camera_config.optical_flow_direction_bins,
+                'frame_history': 10,  # Keep last 10 frames for signature generation
+            }
+
+            optical_flow_analyzer = OpticalFlowAnalyzer(config=flow_config)
+
+            # Create signature directory if it doesn't exist
+            signature_dir = os.path.join(storage_config.local_storage_path,
+                                        storage_config.optical_flow_signature_dir)
+            os.makedirs(signature_dir, exist_ok=True)
+
+            # Initialize motion pattern database
+            db_path = os.path.join(storage_config.local_storage_path,
+                                  storage_config.optical_flow_database_path)
+
+            motion_pattern_db = MotionPatternDatabase(db_path=db_path,
+                                                     signature_dir=signature_dir)
+
+            logger.info(f"Optical flow analyzer initialized with config: {flow_config}")
+            logger.info(f"Motion pattern database at: {db_path}")
+
+            # Pass optical flow components to motion_storage module
+            motion_storage['set_optical_flow_components'](optical_flow_analyzer, motion_pattern_db)
+        else:
+            logger.info("Optical flow analysis disabled by configuration")
+
         # Register signal handlers for graceful shutdown
         for sig in (signal.SIGINT, signal.SIGTERM):
             asyncio.get_event_loop().add_signal_handler(
@@ -290,10 +355,15 @@ async def lifespan(app: FastAPI):
             )
         
         yield
-        
+
+        # Cleanup optical flow resources
+        if optical_flow_analyzer is not None:
+            logger.info("Cleaning up optical flow analyzer")
+            optical_flow_analyzer.reset()
+
         # Cleanup resources when app shuts down
         await handle_shutdown(picam2)()
-        
+
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
         sys.exit(1)
@@ -416,6 +486,29 @@ HTML_TEMPLATE = """
             padding: 5px;
             border-bottom: 1px solid #ddd;
         }}
+        .classification-badge {{
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+            color: white;
+        }}
+        .classification-vehicle {{
+            background-color: #2196F3;  /* Blue */
+        }}
+        .classification-person {{
+            background-color: #4CAF50;  /* Green */
+        }}
+        .classification-animal {{
+            background-color: #FF9800;  /* Orange */
+        }}
+        .classification-environment {{
+            background-color: #9E9E9E;  /* Gray */
+        }}
+        .classification-unknown {{
+            background-color: #757575;  /* Dark Gray */
+        }}
         .config-panel {{
             margin-top: 20px;
             text-align: left;
@@ -507,6 +600,102 @@ HTML_TEMPLATE = """
         .storage-event-active {{
             color: #2196F3;
         }}
+        .pattern-panel {{
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f5f5f5;
+            border-radius: 4px;
+            text-align: left;
+        }}
+        .pattern-panel h3 {{
+            margin-top: 0;
+        }}
+        .pattern-controls {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }}
+        .pattern-stats {{
+            padding: 10px;
+            background-color: white;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }}
+        .pattern-list {{
+            max-height: 400px;
+            overflow-y: auto;
+            background-color: white;
+            border-radius: 4px;
+            padding: 10px;
+        }}
+        .pattern-item {{
+            padding: 12px;
+            margin-bottom: 10px;
+            background-color: #fafafa;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            transition: background-color 0.2s;
+        }}
+        .pattern-item:hover {{
+            background-color: #f0f0f0;
+        }}
+        .pattern-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }}
+        .pattern-id {{
+            font-weight: bold;
+            color: #333;
+            font-size: 14px;
+        }}
+        .pattern-actions {{
+            display: flex;
+            gap: 5px;
+        }}
+        .pattern-actions button {{
+            padding: 4px 8px;
+            font-size: 12px;
+        }}
+        .btn-relabel {{
+            background-color: #2196F3;
+        }}
+        .btn-relabel:hover {{
+            background-color: #1976D2;
+        }}
+        .btn-similar {{
+            background-color: #FF9800;
+        }}
+        .btn-similar:hover {{
+            background-color: #F57C00;
+        }}
+        .btn-delete {{
+            background-color: #f44336;
+        }}
+        .btn-delete:hover {{
+            background-color: #d32f2f;
+        }}
+        .pattern-details {{
+            font-size: 13px;
+            color: #666;
+        }}
+        .pattern-confidence {{
+            font-weight: bold;
+        }}
+        .pagination {{
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 15px;
+            margin-top: 15px;
+        }}
+        .pagination button:disabled {{
+            background-color: #ccc;
+            cursor: not-allowed;
+        }}
     </style>
 </head>
 <body>
@@ -534,6 +723,7 @@ HTML_TEMPLATE = """
             <button id="toggleConfig">Show Configuration</button>
             <button id="toggleHistory">Show Motion History</button>
             <button id="toggleStorage">Show Storage Stats</button>
+            <button id="togglePatterns">Show Motion Patterns</button>
         </div>
         
         <div class="motion-history" id="motionHistory" style="display: none;">
@@ -586,6 +776,29 @@ HTML_TEMPLATE = """
             </div>
             <div class="form-row">
                 <button id="saveConfig">Save Configuration</button>
+            </div>
+        </div>
+
+        <div class="pattern-panel" id="patternPanel" style="display: none;">
+            <h3>Motion Pattern Database</h3>
+            <div class="pattern-controls">
+                <label for="patternFilter">Filter by type:</label>
+                <select id="patternFilter">
+                    <option value="all">All Patterns</option>
+                    <option value="vehicle">Vehicle</option>
+                    <option value="person">Person</option>
+                    <option value="animal">Animal</option>
+                    <option value="environment">Environment</option>
+                    <option value="unknown">Unknown</option>
+                </select>
+                <button id="refreshPatterns">Refresh</button>
+            </div>
+            <div id="patternStats" class="pattern-stats"></div>
+            <div id="patternList" class="pattern-list">Loading patterns...</div>
+            <div class="pagination">
+                <button id="prevPage" disabled>Previous</button>
+                <span id="pageInfo">Page 1</span>
+                <button id="nextPage">Next</button>
             </div>
         </div>
     </div>
@@ -675,7 +888,24 @@ HTML_TEMPLATE = """
                     data.motion_history.forEach(event => {{
                         const eventDiv = document.createElement('div');
                         eventDiv.className = 'motion-event';
-                        eventDiv.textContent = `${{event.timestamp}} - ${{event.regions.length}} regions detected`;
+
+                        // Build event text with classification if available
+                        let eventText = `${{event.timestamp}} - ${{event.regions.length}} regions`;
+                        if (event.classification) {{
+                            const confidence = (event.classification.confidence * 100).toFixed(0);
+                            eventText += ` - ${{event.classification.label}} (${{confidence}}%)`;
+
+                            // Add badge styling based on classification
+                            const badge = document.createElement('span');
+                            badge.className = 'classification-badge classification-' + event.classification.label.toLowerCase();
+                            badge.textContent = event.classification.label;
+                            eventDiv.appendChild(document.createTextNode(`${{event.timestamp}} - ${{event.regions.length}} regions - `));
+                            eventDiv.appendChild(badge);
+                            eventDiv.appendChild(document.createTextNode(` (${{confidence}}%)`));
+                        }} else {{
+                            eventDiv.textContent = eventText;
+                        }}
+
                         motionEvents.appendChild(eventDiv);
                     }});
                     
@@ -750,6 +980,182 @@ HTML_TEMPLATE = """
                 updateStorageStats();
             }}
         }}, 5000);
+
+        // Pattern management functionality
+        let currentPage = 0;
+        let currentFilter = 'all';
+        const patternsPerPage = 20;
+
+        document.getElementById('togglePatterns').addEventListener('click', function() {{
+            const panel = document.getElementById('patternPanel');
+            const isVisible = panel.style.display !== 'none';
+            panel.style.display = isVisible ? 'none' : 'block';
+            this.textContent = isVisible ? 'Show Motion Patterns' : 'Hide Motion Patterns';
+
+            if (!isVisible) {{
+                loadPatterns();
+            }}
+        }});
+
+        document.getElementById('patternFilter').addEventListener('change', function() {{
+            currentFilter = this.value;
+            currentPage = 0;
+            loadPatterns();
+        }});
+
+        document.getElementById('refreshPatterns').addEventListener('click', function() {{
+            loadPatterns();
+        }});
+
+        document.getElementById('prevPage').addEventListener('click', function() {{
+            if (currentPage > 0) {{
+                currentPage--;
+                loadPatterns();
+            }}
+        }});
+
+        document.getElementById('nextPage').addEventListener('click', function() {{
+            currentPage++;
+            loadPatterns();
+        }});
+
+        function loadPatterns() {{
+            const offset = currentPage * patternsPerPage;
+
+            fetch(`/patterns?limit=${{patternsPerPage}}&offset=${{offset}}`)
+                .then(response => response.json())
+                .then(data => {{
+                    displayPatterns(data);
+                    updatePagination(data);
+                    updatePatternStats(data);
+                }})
+                .catch(error => {{
+                    console.error('Error loading patterns:', error);
+                    document.getElementById('patternList').innerHTML =
+                        '<p style="color: red;">Error loading patterns</p>';
+                }});
+        }}
+
+        function displayPatterns(data) {{
+            const patternList = document.getElementById('patternList');
+
+            if (!data.patterns || data.patterns.length === 0) {{
+                patternList.innerHTML = '<p>No patterns found</p>';
+                return;
+            }}
+
+            // Filter patterns if needed
+            let patterns = data.patterns;
+            if (currentFilter !== 'all') {{
+                patterns = patterns.filter(p => p.classification === currentFilter);
+            }}
+
+            patternList.innerHTML = '';
+            patterns.forEach(pattern => {{
+                const item = document.createElement('div');
+                item.className = 'pattern-item';
+
+                const confidence = (pattern.confidence * 100).toFixed(0);
+                const metadata = pattern.metadata || {{}};
+
+                item.innerHTML = `
+                    <div class="pattern-header">
+                        <span class="pattern-id">${{pattern.pattern_id}}</span>
+                        <div class="pattern-actions">
+                            <button class="btn-relabel" onclick="relabelPattern('${{pattern.pattern_id}}')">Relabel</button>
+                            <button class="btn-similar" onclick="findSimilar('${{pattern.pattern_id}}')">Similar</button>
+                            <button class="btn-delete" onclick="deletePattern('${{pattern.pattern_id}}')">Delete</button>
+                        </div>
+                    </div>
+                    <div class="pattern-details">
+                        <span class="classification-badge classification-${{pattern.classification}}">
+                            ${{pattern.classification}}
+                        </span>
+                        <span class="pattern-confidence">Confidence: ${{confidence}}%</span>
+                        <br>
+                        <small>Created: ${{new Date(pattern.created_at).toLocaleString()}}</small>
+                        ${{metadata.duration ? `<br><small>Duration: ${{metadata.duration.toFixed(1)}}s, Frames: ${{metadata.frame_count || 0}}</small>` : ''}}
+                    </div>
+                `;
+
+                patternList.appendChild(item);
+            }});
+        }}
+
+        function updatePagination(data) {{
+            const totalPages = Math.ceil(data.total / patternsPerPage);
+            document.getElementById('pageInfo').textContent = `Page ${{currentPage + 1}} of ${{totalPages}}`;
+            document.getElementById('prevPage').disabled = currentPage === 0;
+            document.getElementById('nextPage').disabled = currentPage >= totalPages - 1;
+        }}
+
+        function updatePatternStats(data) {{
+            const stats = document.getElementById('patternStats');
+            stats.innerHTML = `<strong>Total patterns: ${{data.total}}</strong>`;
+        }}
+
+        function relabelPattern(patternId) {{
+            const newLabel = prompt('Enter new classification (vehicle/person/animal/environment/unknown):');
+            if (!newLabel) return;
+
+            const validLabels = ['vehicle', 'person', 'animal', 'environment', 'unknown'];
+            if (!validLabels.includes(newLabel.toLowerCase())) {{
+                alert('Invalid classification. Must be one of: vehicle, person, animal, environment, unknown');
+                return;
+            }}
+
+            fetch(`/patterns/${{patternId}}/label`, {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ classification: newLabel.toLowerCase() }})
+            }})
+            .then(response => response.json())
+            .then(data => {{
+                alert('Pattern relabeled successfully');
+                loadPatterns();
+            }})
+            .catch(error => {{
+                alert('Error relabeling pattern');
+                console.error(error);
+            }});
+        }}
+
+        function findSimilar(patternId) {{
+            fetch(`/patterns/similar/${{patternId}}?limit=10&threshold=0.5`)
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.similar_patterns && data.similar_patterns.length > 0) {{
+                        let message = `Found ${{data.similar_patterns.length}} similar patterns:\\n\\n`;
+                        data.similar_patterns.forEach(p => {{
+                            message += `${{p.pattern_id}}: ${{p.classification}} (similarity: ${{(p.similarity * 100).toFixed(0)}}%)\\n`;
+                        }});
+                        alert(message);
+                    }} else {{
+                        alert('No similar patterns found');
+                    }}
+                }})
+                .catch(error => {{
+                    alert('Error finding similar patterns');
+                    console.error(error);
+                }});
+        }}
+
+        function deletePattern(patternId) {{
+            if (!confirm(`Delete pattern ${{patternId}}?`)) return;
+
+            fetch(`/patterns/${{patternId}}`, {{
+                method: 'DELETE'
+            }})
+            .then(response => response.json())
+            .then(data => {{
+                alert('Pattern deleted successfully');
+                loadPatterns();
+            }})
+            .catch(error => {{
+                alert('Error deleting pattern');
+                console.error(error);
+            }});
+        }}
     </script>
 </body>
 </html>
@@ -867,21 +1273,38 @@ async def get_status():
 
 @app.get("/motion_status")
 async def get_motion_status():
-    """Get motion detection status"""
+    """Get motion detection status with optical flow classification"""
+    # Process motion history with classification info
+    history_with_classification = []
+    for item in motion_history[-camera_config.motion_history_size:]:
+        if len(item) == 3:  # New format: (timestamp, regions, classification)
+            timestamp, regions, classification = item
+            entry = {
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "regions": regions
+            }
+            if classification:
+                entry["classification"] = classification
+            history_with_classification.append(entry)
+        else:  # Old format: (timestamp, regions)
+            timestamp, regions = item
+            history_with_classification.append({
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "regions": regions
+            })
+
     return {
         "motion_detected": motion_detected,
-        "motion_history": [
-            {"timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"), "regions": regions}
-            for timestamp, regions in motion_history[-camera_config.motion_history_size:]
-        ],
-        "active_connections": len(active_connections)
+        "motion_history": history_with_classification,
+        "active_connections": len(active_connections),
+        "optical_flow_enabled": camera_config.optical_flow_enabled and optical_flow_analyzer is not None
     }
 
 @app.post("/config")
 async def update_config(config: CameraConfigUpdate):
     """Update camera configuration"""
     global camera_config
-    
+
     if config.width is not None:
         camera_config.width = config.width
     if config.height is not None:
@@ -906,9 +1329,186 @@ async def update_config(config: CameraConfigUpdate):
         camera_config.motion_min_area = config.motion_min_area
     if config.highlight_motion is not None:
         camera_config.highlight_motion = config.highlight_motion
-        
+
     logger.info(f"Configuration updated: {camera_config}")
     return {"message": "Configuration updated", "restart_required": False}
+
+@app.get("/patterns")
+async def get_patterns(limit: int = 50, offset: int = 0):
+    """Get list of motion patterns from database"""
+    global motion_pattern_db
+
+    if motion_pattern_db is None:
+        return {"patterns": [], "total": 0}
+
+    try:
+        conn = sqlite3.connect(motion_pattern_db.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get total count
+        cursor.execute('SELECT COUNT(*) as count FROM motion_patterns')
+        total = cursor.fetchone()['count']
+
+        # Get patterns with pagination
+        cursor.execute('''
+            SELECT id, pattern_id, classification, confidence, metadata, created_at
+            FROM motion_patterns
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        ''', (limit, offset))
+
+        patterns = []
+        for row in cursor.fetchall():
+            patterns.append({
+                'id': row['id'],
+                'pattern_id': row['pattern_id'],
+                'classification': row['classification'],
+                'confidence': row['confidence'],
+                'metadata': json.loads(row['metadata']) if row['metadata'] else {},
+                'created_at': row['created_at']
+            })
+
+        conn.close()
+
+        return {
+            'patterns': patterns,
+            'total': total,
+            'limit': limit,
+            'offset': offset
+        }
+    except Exception as e:
+        logger.error(f"Error fetching patterns: {e}")
+        return {"patterns": [], "total": 0, "error": str(e)}
+
+@app.get("/patterns/{pattern_id}")
+async def get_pattern_detail(pattern_id: str):
+    """Get detailed information about a specific pattern"""
+    global motion_pattern_db
+
+    if motion_pattern_db is None:
+        raise HTTPException(status_code=503, detail="Pattern database not available")
+
+    try:
+        pattern = motion_pattern_db.get_pattern(pattern_id)
+        if pattern is None:
+            raise HTTPException(status_code=404, detail="Pattern not found")
+
+        return pattern
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching pattern {pattern_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/patterns/{pattern_id}/label")
+async def update_pattern_label(pattern_id: str, label: dict):
+    """Update the label for a pattern (for training/correction)"""
+    global motion_pattern_db
+
+    if motion_pattern_db is None:
+        raise HTTPException(status_code=503, detail="Pattern database not available")
+
+    new_label = label.get('classification')
+    if not new_label:
+        raise HTTPException(status_code=400, detail="Missing 'classification' field")
+
+    try:
+        conn = sqlite3.connect(motion_pattern_db.db_path)
+        cursor = conn.cursor()
+
+        # Update classification
+        cursor.execute('''
+            UPDATE motion_patterns
+            SET classification = ?, confidence = 1.0
+            WHERE pattern_id = ?
+        ''', (new_label, pattern_id))
+
+        if cursor.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Pattern not found")
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Updated pattern {pattern_id} label to {new_label}")
+        return {"message": "Label updated", "pattern_id": pattern_id, "new_label": new_label}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating pattern label: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/patterns/{pattern_id}")
+async def delete_pattern(pattern_id: str):
+    """Delete a pattern from the database"""
+    global motion_pattern_db
+
+    if motion_pattern_db is None:
+        raise HTTPException(status_code=503, detail="Pattern database not available")
+
+    try:
+        conn = sqlite3.connect(motion_pattern_db.db_path)
+        cursor = conn.cursor()
+
+        # Get signature path before deleting
+        cursor.execute('SELECT signature_path FROM motion_patterns WHERE pattern_id = ?', (pattern_id,))
+        row = cursor.fetchone()
+
+        if row is None:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Pattern not found")
+
+        signature_path = row[0]
+
+        # Delete from database
+        cursor.execute('DELETE FROM motion_patterns WHERE pattern_id = ?', (pattern_id,))
+        conn.commit()
+        conn.close()
+
+        # Delete signature file if it exists
+        if signature_path and os.path.exists(signature_path):
+            os.remove(signature_path)
+
+        logger.info(f"Deleted pattern {pattern_id}")
+        return {"message": "Pattern deleted", "pattern_id": pattern_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting pattern: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/patterns/similar/{pattern_id}")
+async def find_similar(pattern_id: str, limit: int = 10, threshold: float = 0.7):
+    """Find patterns similar to the given pattern"""
+    global motion_pattern_db
+
+    if motion_pattern_db is None:
+        raise HTTPException(status_code=503, detail="Pattern database not available")
+
+    try:
+        # Get the pattern
+        pattern = motion_pattern_db.get_pattern(pattern_id)
+        if pattern is None:
+            raise HTTPException(status_code=404, detail="Pattern not found")
+
+        # Find similar patterns
+        similar = motion_pattern_db.find_similar_patterns(
+            pattern['signature'],
+            limit=limit,
+            similarity_threshold=threshold
+        )
+
+        return {
+            'pattern_id': pattern_id,
+            'similar_patterns': similar,
+            'count': len(similar)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error finding similar patterns: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Helper functions for frame processing
 def add_timestamp(frame):
@@ -957,28 +1557,39 @@ def add_timestamp(frame):
         logger.error(f"Error adding timestamp: {e}")
         return frame
 
-def detect_motion(frame):
-    """Detect motion in frame and return motion regions"""
-    global prev_frame, motion_history
-    
+def detect_motion(frame, prev_color_frame=None, frame_index=0):
+    """
+    Detect motion in frame and return motion regions with optical flow features.
+
+    Args:
+        frame: Current frame (BGR)
+        prev_color_frame: Previous frame for optical flow (BGR, optional)
+        frame_index: Frame counter for frame skipping (optional)
+
+    Returns:
+        Tuple of (motion_detected, regions, flow_features)
+    """
+    global prev_frame, motion_history, optical_flow_analyzer
+
     if frame is None or not camera_config.motion_detection:
-        return False, []
-        
+        return False, [], None
+
     logger.debug("[MOTION_FLOW] Processing frame for motion detection")
     frame_time = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        
+
     try:
-        # Convert to grayscale
+        # Convert to grayscale for motion detection
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
+
         # Apply gaussian blur
-        gray = cv2.GaussianBlur(gray, (camera_config.motion_blur, camera_config.motion_blur), 0)
-        
+        blur_kernel = camera_config.motion_blur if camera_config.motion_blur % 2 == 1 else camera_config.motion_blur + 1
+        gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+
         # If first frame or prev_frame is None, initialize it
         if prev_frame is None:
             logger.info(f"[MOTION_FLOW] {frame_time} Initializing first frame for motion detection")
             prev_frame = gray
-            return False, []
+            return False, [], None
         
         # Calculate absolute difference between current and previous frame
         frame_delta = cv2.absdiff(prev_frame, gray)
@@ -1006,31 +1617,91 @@ def detect_motion(frame):
             regions.append((x, y, w, h))
             motion_detected = True
         
+        # Update previous frame
+        prev_frame = gray
+
+        # Initialize flow features
+        flow_features = None
+
+        # If motion is detected and optical flow is enabled, calculate optical flow
+        # Skip frames for performance (process every Nth frame)
+        should_process_flow = (
+            motion_detected and
+            camera_config.optical_flow_enabled and
+            optical_flow_analyzer is not None and
+            prev_color_frame is not None and
+            (frame_index % camera_config.optical_flow_frame_skip == 0)
+        )
+
+        if should_process_flow:
+            try:
+                # Optionally downscale for performance
+                if hasattr(storage_config, 'optical_flow_max_resolution'):
+                    max_w, max_h = storage_config.optical_flow_max_resolution
+                    h, w = frame.shape[:2]
+                    if w > max_w or h > max_h:
+                        scale = min(max_w / w, max_h / h)
+                        new_w, new_h = int(w * scale), int(h * scale)
+                        frame_scaled = cv2.resize(frame, (new_w, new_h))
+                        prev_frame_scaled = cv2.resize(prev_color_frame, (new_w, new_h))
+
+                        # Scale regions to match downscaled frame
+                        regions_scaled = [(int(x*scale), int(y*scale), int(w*scale), int(h*scale))
+                                         for x, y, w, h in regions]
+
+                        flow_features = optical_flow_analyzer.extract_flow(
+                            prev_frame_scaled, frame_scaled, regions_scaled)
+                    else:
+                        flow_features = optical_flow_analyzer.extract_flow(prev_color_frame, frame, regions)
+                else:
+                    flow_features = optical_flow_analyzer.extract_flow(prev_color_frame, frame, regions)
+
+            except Exception as e:
+                logger.error(f"Error extracting optical flow: {e}")
+                flow_features = None
+
         # If motion is detected, add to history
         if motion_detected:
             motion_time = datetime.datetime.now()
-            motion_history.append((motion_time, regions))
+
+            # Generate real-time classification (optional, only if visualization enabled)
+            classification = None
+            if (flow_features and optical_flow_analyzer and
+                camera_config.optical_flow_visualization):
+                try:
+                    # Only generate signature if we have enough history
+                    if len(optical_flow_analyzer.flow_history) >= 3:
+                        signature = optical_flow_analyzer.generate_motion_signature()
+                        if signature:
+                            classification = optical_flow_analyzer.classify_motion(signature)
+                except Exception as e:
+                    logger.error(f"Error generating real-time classification: {e}")
+
+            motion_history.append((motion_time, regions, classification))
+
             # Trim history if needed
             if len(motion_history) > camera_config.motion_history_size * 2:  # Keep twice the display size for history
                 motion_history = motion_history[-camera_config.motion_history_size * 2:]
-                
+
             # Log with high visibility to track motion detection precisely
             contour_areas = [cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= camera_config.motion_min_area]
             logger.critical(f"[MOTION_DETECTED] {frame_time} Motion detected! Regions: {len(regions)}")
             logger.critical(f"[MOTION_DETECTED] Contour areas: {contour_areas}")
             logger.critical(f"[MOTION_DETECTED] Motion threshold: {camera_config.motion_threshold}, Min area: {camera_config.motion_min_area}")
-            logger.info(f"[MOTION_FLOW] {frame_time} Motion detected! Regions: {len(regions)}, Contour areas: {contour_areas}")
-        
-        # Update previous frame
-        prev_frame = gray
-        
+
+            if classification:
+                logger.info(f"[MOTION_FLOW] {frame_time} Motion detected! Regions: {len(regions)}, "
+                           f"Classification: {classification['label']} ({classification['confidence']:.2f})")
+            else:
+                logger.info(f"[MOTION_FLOW] {frame_time} Motion detected! Regions: {len(regions)}, Contour areas: {contour_areas}")
+
         if not motion_detected and random.random() < 0.01:  # Log about 1% of non-motion frames to avoid excessive logging
             logger.debug(f"[MOTION_FLOW] {frame_time} No motion detected")
-        
-        return motion_detected, regions
+
+        return motion_detected, regions, flow_features
     except Exception as e:
         logger.error(f"Error detecting motion: {e}")
-        return False, []
+        return False, [], None
 
 # Parse command-line arguments
 def parse_arguments():

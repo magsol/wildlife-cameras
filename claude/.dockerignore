@@ -1,0 +1,29 @@
+# Don't copy these into Docker image
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+*.egg-info
+.DS_Store
+.vscode
+.idea
+
+# Don't copy test results
+test_results/
+htmlcov/
+
+# Don't copy large data
+*.mp4
+*.avi
+*.mov
+test_videos/
+
+# Don't copy virtual environments
+.venv/
+venv/
+.pixi/

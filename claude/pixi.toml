@@ -55,6 +55,15 @@ test-video = { cmd = "python test_optical_flow.py --mode video --input $1" }
 test-camera = { cmd = "python test_optical_flow.py --mode camera --duration $1" }
 benchmark = { cmd = "python test_optical_flow.py --mode benchmark --input $1" }
 
+# Mock camera testing
+test-mock-camera = { cmd = "python mock_camera_test.py" }
+
+# Docker ARM64 testing (requires Docker installed and running)
+test-arm64 = { cmd = "docker compose run rpi-full-test" }
+test-arm64-integration = { cmd = "docker compose run rpi-test" }
+test-arm64-dev = { cmd = "docker compose up rpi-dev" }
+docker-build-arm64 = { cmd = "docker buildx build --platform linux/arm64 -f Dockerfile.rpi -t wildlife-camera:arm64 ." }
+
 # Linting tasks
 format = { cmd = "ruff format ." }
 lint = { cmd = "ruff check ." }
@@ -68,4 +77,4 @@ dev-workflow = { cmd = "echo 'Running development workflow...' && pixi run lint 
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "dev" }
 lint = { features = ["lint"], solve-group = "lint" }
-optical_flow_test = { features = ["optical_flow_test"], solve-group = "optical_flow_test" }
+opticalflowtest = { features = ["optical_flow_test"], solve-group = "optical_flow_test" }
