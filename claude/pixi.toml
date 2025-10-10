@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Raspberry Pi NoIR camera motion detection and video storage system"
 authors = ["Shannon Quinn"]
 channels = ["conda-forge"]
-platforms = ["linux-64", "osx-64", "osx-arm64"]
+platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 
 [dependencies]
 python = ">=3.9,<3.12"

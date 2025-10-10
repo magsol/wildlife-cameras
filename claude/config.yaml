@@ -1,0 +1,87 @@
+camera:
+  width: 640
+  height: 480
+  frame_rate: 30
+  rotation: 0
+  max_clients: 10
+  client_timeout: 30
+  show_timestamp: true
+  timestamp_position: bottom-right
+  timestamp_color: !!python/tuple
+  - 255
+  - 255
+  - 255
+  timestamp_size: 0.7
+motion_detection:
+  enabled: true
+  threshold: 25
+  min_area: 500
+  blur_kernel_size: 21
+  highlight_motion: true
+  history_size: 50
+optical_flow:
+  enabled: true
+  feature_max: 100
+  min_distance: 7
+  quality_level: 0.3
+  grid_size: !!python/tuple
+  - 8
+  - 8
+  direction_bins: 8
+  frame_skip: 2
+  max_resolution: !!python/tuple
+  - 320
+  - 240
+  visualization: false
+  visualization_scale: 1.5
+  min_features: 10
+  feature_quality_threshold: 0.01
+  frame_history: 10
+storage:
+  ram_buffer_seconds: 30
+  max_ram_segments: 300
+  local_storage_path: ./motion_events
+  max_disk_usage_mb: 1000
+  min_motion_duration_sec: 3
+  remote_storage_url: http://192.168.1.100:8080/storage
+  remote_api_key: your_api_key_here
+  upload_throttle_kbps: 500
+  chunk_upload: true
+  transfer_retry_interval_sec: 60
+  transfer_schedule_active: true
+  transfer_schedule_start: 1
+  transfer_schedule_end: 5
+  generate_thumbnails: true
+  thumbnail_width: 320
+  thumbnail_height: 240
+  thumbnails_per_event: 3
+  wifi_monitoring: true
+  wifi_adapter: wlan0
+  wifi_signal_threshold_low: -75
+  wifi_signal_threshold_good: -65
+  wifi_throttle_poor: 100
+  wifi_throttle_medium: 300
+  wifi_throttle_good: 800
+optical_flow_storage:
+  store_data: true
+  signature_dir: flow_signatures
+  database_path: motion_patterns.db
+  classification_enabled: true
+  min_classification_confidence: 0.5
+  save_visualizations: true
+server:
+  host: 0.0.0.0
+  port: 8000
+  log_level: info
+  reload: false
+storage_server:
+  host: 0.0.0.0
+  port: 8080
+  storage_path: ./received_events
+  max_storage_gb: 50
+  require_api_key: true
+  api_keys:
+  - your_api_key_here
+  enable_chunked_uploads: true
+  chunk_size_mb: 5
+  cleanup_incomplete_hours: 24

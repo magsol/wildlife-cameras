@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -32,6 +33,13 @@ from typing import Dict, List, Optional, Tuple, Any, Set
 
 # Import optical flow analyzer for classification
 from optical_flow_analyzer import OpticalFlowAnalyzer, MotionPatternDatabase
+
+# Import centralized configuration (optional - for standalone use)
+try:
+    from config import get_config, StorageConfig as CentralizedStorageConfig
+    _has_centralized_config = True
+except ImportError:
+    _has_centralized_config = False
 
 # Helper function to detect Raspberry Pi
 def is_raspberry_pi():
@@ -101,6 +109,8 @@ def set_optical_flow_components(analyzer, pattern_db):
 
 # Storage configuration
 @dataclass
+# DEPRECATED: StorageConfig is now in config.py
+# This class is kept for backward compatibility but is no longer used internally
 class StorageConfig:
     # RAM Buffer settings
     ram_buffer_seconds: int = 30       # Seconds to keep in RAM before/after motion
@@ -1003,32 +1013,34 @@ class TransferManager:
                     logger.error(f"Upload failed for {event_id}: {stderr.decode()}")
                 
             else:
-                # Use requests library
-                files = {'video': open(video_path, 'rb')}
-                
-                # Add thumbnails if available
-                thumbnails_dir = os.path.join(event_dir, "thumbnails")
-                if os.path.exists(thumbnails_dir):
-                    for i, thumb_file in enumerate(os.listdir(thumbnails_dir)):
-                        if thumb_file.endswith('.jpg'):
-                            thumb_path = os.path.join(thumbnails_dir, thumb_file)
-                            files[f'thumbnail_{i}'] = open(thumb_path, 'rb')
-                
-                logger.info(f"Uploading event {event_id}")
-                response = requests.post(
-                    self.config.remote_storage_url,
-                    files=files,
-                    data={'metadata': json.dumps(metadata)},
-                    headers={'X-API-Key': self.config.remote_api_key}
-                )
-                
-                # Close all file handles
-                for f in files.values():
-                    f.close()
-                    
-                success = response.status_code == 200
-                if not success:
-                    logger.error(f"Upload failed for {event_id}: {response.text}")
+                # Use requests library with proper resource management
+                with ExitStack() as stack:
+                    # Open all files in context manager
+                    files = {}
+                    files['video'] = stack.enter_context(open(video_path, 'rb'))
+
+                    # Add thumbnails if available
+                    thumbnails_dir = os.path.join(event_dir, "thumbnails")
+                    if os.path.exists(thumbnails_dir):
+                        for i, thumb_file in enumerate(os.listdir(thumbnails_dir)):
+                            if thumb_file.endswith('.jpg'):
+                                thumb_path = os.path.join(thumbnails_dir, thumb_file)
+                                files[f'thumbnail_{i}'] = stack.enter_context(
+                                    open(thumb_path, 'rb')
+                                )
+
+                    # All files guaranteed to close when exiting this block
+                    logger.info(f"Uploading event {event_id}")
+                    response = requests.post(
+                        self.config.remote_storage_url,
+                        files=files,
+                        data={'metadata': json.dumps(metadata)},
+                        headers={'X-API-Key': self.config.remote_api_key}
+                    )
+
+                    success = response.status_code == 200
+                    if not success:
+                        logger.error(f"Upload failed for {event_id}: {response.text}")
                     
             if success:
                 logger.info(f"Successfully uploaded event {event_id}")

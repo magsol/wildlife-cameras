@@ -157,48 +157,77 @@ If you see a preview window or "Camera working!", the camera is connected correc
 
 ## Step 5: Configure the Application
 
-### 5.1 Create Storage Directories
+### 5.1 Generate Configuration File
+
+The system now uses a centralized configuration file for all settings:
+
+```bash
+cd ~/wildlife-camera
+
+# Generate default configuration file
+pixi run python3 storage_server.py --generate-config
+
+# This creates config.yaml with all settings
+```
+
+### 5.2 Edit Configuration
+
+Edit `config.yaml` to customize your settings:
+
+```bash
+nano config.yaml
+```
+
+Key settings to review in `config.yaml`:
+
+```yaml
+camera:
+  width: 640
+  height: 480
+  frame_rate: 30  # May need to reduce to 15 for better performance
+  rotation: 0
+
+motion_detection:
+  enabled: true
+  threshold: 25  # Lower = more sensitive
+  min_area: 500  # Minimum pixel area
+
+optical_flow:
+  enabled: true
+  frame_skip: 2  # Process every 2nd frame
+  feature_max: 100
+  visualization: false  # Expensive, disabled by default
+
+storage:
+  local_storage_path: ./motion_events
+  max_disk_usage_mb: 1000  # 1GB max
+  remote_storage_url: http://192.168.1.100:8080/storage
+  upload_throttle_kbps: 500  # 0 = disabled
+
+optical_flow_storage:
+  store_data: true
+  signature_dir: flow_signatures
+  database_path: motion_patterns.db
+  classification_enabled: true
+
+server:
+  host: 0.0.0.0
+  port: 8000
+```
+
+**Configuration Methods:**
+1. **Config File**: Edit `config.yaml` (recommended)
+2. **Environment Variables**: Set `WC_CAMERA_WIDTH=1920`, etc.
+3. **Command-Line**: Use `--width 1920 --port 8000`, etc.
+4. **Web UI**: Adjust some settings via browser after starting
+
+### 5.3 Create Storage Directories
+
+The system will auto-create directories, but you can create them manually if desired:
 
 ```bash
 cd ~/wildlife-camera
 mkdir -p motion_events flow_signatures
-```
-
-### 5.2 Review Configuration
-
-The main configuration is in `fastapi_mjpeg_server_with_storage.py`. Default settings:
-
-```python
-# Camera settings
-width: 640
-height: 480
-frame_rate: 15
-
-# Motion detection
-motion_detection: True
-motion_threshold: 25
-motion_min_area: 500
-
-# Optical flow
-optical_flow_enabled: True
-optical_flow_frame_skip: 2  # Process every 2nd frame
-
-# Storage
-store_motion_events: True
-motion_storage_path: "./motion_events"
-```
-
-**To customize settings**, edit the `CameraConfig` class in `fastapi_mjpeg_server_with_storage.py` or use the web UI after starting.
-
-### 5.3 Optional: Configure Remote Storage
-
-If you want to upload events to a remote server, edit `StorageConfig` in `motion_storage.py`:
-
-```python
-# Remote storage settings
-remote_storage_enabled: True
-remote_storage_url: "https://your-server.com/upload"
-remote_storage_api_key: "your-api-key"
 ```
 
 ---

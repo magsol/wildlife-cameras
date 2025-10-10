@@ -13,11 +13,13 @@ import asyncio
 import cv2
 import datetime
 import io
+import json
 import logging
 import numpy as np
 import os
 import random
 import signal
+import sqlite3
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -32,9 +34,12 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, field_validator
 
+# Import centralized configuration
+from config import get_config, WildlifeCameraConfig
+from cli import load_config_with_cli
+
 # Import motion storage module
 from motion_storage import initialize as init_motion_storage
-from motion_storage import StorageConfig
 
 # Import optical flow analyzer
 from optical_flow_analyzer import OpticalFlowAnalyzer, MotionPatternDatabase
@@ -56,47 +61,62 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fastapi_mjpeg_server")
 
-# Global configurations with defaults
-@dataclass
-class CameraConfig:
-    width: int = 640
-    height: int = 480
-    frame_rate: int = 30
-    rotation: int = 0
-    max_clients: int = 10
-    client_timeout: int = 30  # seconds
-    show_timestamp: bool = True
-    timestamp_position: str = 'bottom-right'  # top-left, top-right, bottom-left, bottom-right
-    timestamp_color: Tuple[int, int, int] = (255, 255, 255)  # RGB
-    timestamp_size: float = 0.7
-    motion_detection: bool = True
-    motion_threshold: int = 25  # Motion sensitivity (lower = more sensitive)
-    motion_min_area: int = 500  # Minimum pixel area to consider as motion
-    motion_blur: int = 21  # Motion blur kernel size
-    highlight_motion: bool = True
-    motion_history_size: int = 50  # Number of motion events to keep in history
-
-    # Optical flow configuration
-    optical_flow_enabled: bool = True
-    optical_flow_feature_max: int = 100
-    optical_flow_min_distance: int = 7
-    optical_flow_quality_level: float = 0.3
-    optical_flow_grid_size: Tuple[int, int] = (8, 8)
-    optical_flow_direction_bins: int = 8
-    optical_flow_visualization: bool = False  # Expensive, disable by default
-    optical_flow_frame_skip: int = 2  # Process every Nth frame for performance
-
-# Global variables
-camera_config = CameraConfig()
+# Global configuration (initialized in main)
+# Note: We maintain these as separate variables for backward compatibility
+# They will point to the centralized config sections
+config = None  # type: WildlifeCameraConfig
+camera_config = None  # Points to config.camera
+storage_config = None  # Points to config.storage
 active_connections: List[str] = []
+active_connections_lock = threading.Lock()
 camera_initialized = False
 shutdown_event = asyncio.Event()
 
-# Motion detection variables
-prev_frame = None
-motion_detected = False
-motion_regions = []
-motion_history = []  # List of (timestamp, region, classification) tuples
+# Thread-safe motion state
+class ThreadSafeMotionState:
+    """Thread-safe container for motion detection state"""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.prev_frame = None
+        self.detected = False
+        self.regions = []
+        self.history = []
+
+    def update_detection(self, detected: bool, regions: List[Tuple[int, int, int, int]],
+                        classification=None):
+        """Update motion detection state (called from camera thread)"""
+        with self.lock:
+            self.detected = detected
+            self.regions = regions[:]  # Copy list
+            if detected:
+                self.history.append((datetime.datetime.now(), regions[:], classification))
+                # Trim history if needed
+                max_size = camera_config.motion_history_size * 2 if camera_config else 100
+                if len(self.history) > max_size:
+                    self.history = self.history[-max_size:]
+
+    def update_prev_frame(self, frame):
+        """Update previous frame (called from camera thread)"""
+        with self.lock:
+            self.prev_frame = frame
+
+    def get_prev_frame(self):
+        """Get previous frame copy (called from camera thread)"""
+        with self.lock:
+            return self.prev_frame
+
+    def get_status(self):
+        """Get current motion status (called from API threads)"""
+        with self.lock:
+            return self.detected, self.regions[:], self.history[:]
+
+    def get_detection_state(self):
+        """Get just detection flag and regions (called from camera thread)"""
+        with self.lock:
+            return self.detected, self.regions[:]
+
+# Initialize thread-safe motion state
+motion_state = ThreadSafeMotionState()
 
 # Optical flow variables
 optical_flow_analyzer: Optional[OpticalFlowAnalyzer] = None
@@ -120,8 +140,6 @@ class FrameBuffer(io.BufferedIOBase):
         This method accepts variadic arguments to handle both direct calls and calls
         from PiCamera2's FileOutput class.
         """
-        global prev_frame, motion_detected, motion_regions
-
         with self.condition:
             # Store the original buffer
             original_buf = buf
@@ -140,18 +158,21 @@ class FrameBuffer(io.BufferedIOBase):
                     self.last_frame = raw_img.copy()
                     self.frame_index += 1
 
-                    # Detect motion with optical flow
-                    motion_detected, motion_regions, flow_features = detect_motion(
+                    # Detect motion with optical flow (updates motion_state internally)
+                    motion_detected_local, motion_regions_local, flow_features = detect_motion(
                         raw_img, prev_frame_for_flow, self.frame_index)
                 
                 # Add timestamp if enabled
                 if camera_config.show_timestamp:
                     img_with_timestamp = add_timestamp(raw_img)
-                    
+
                     # Add motion indicators if motion detected and highlighting enabled
-                    if motion_detected and camera_config.highlight_motion:
-                        for x, y, w, h in motion_regions:
-                            cv2.rectangle(img_with_timestamp, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    if camera_config.motion_detection and camera_config.highlight_motion:
+                        # Get current detection state for highlighting
+                        detected, regions = motion_state.get_detection_state()
+                        if detected:
+                            for x, y, w, h in regions:
+                                cv2.rectangle(img_with_timestamp, (x, y), (x + w, y + h), (0, 0, 255), 2)
                             
                     # Re-encode the modified image back to JPEG
                     _, processed_buf = cv2.imencode('.jpg', img_with_timestamp)
@@ -309,8 +330,8 @@ async def lifespan(app: FastAPI):
         logger.info("Successfully patched frame buffer write method")
 
         # Initialize optical flow analyzer and pattern database
-        global optical_flow_analyzer, motion_pattern_db
-        if storage_config.motion_classification_enabled and camera_config.optical_flow_enabled:
+        global optical_flow_analyzer, motion_pattern_db, config
+        if config.optical_flow_storage.classification_enabled and camera_config.optical_flow_enabled:
             logger.info("Initializing optical flow analyzer")
 
             # Create optical flow configuration
@@ -330,12 +351,12 @@ async def lifespan(app: FastAPI):
 
             # Create signature directory if it doesn't exist
             signature_dir = os.path.join(storage_config.local_storage_path,
-                                        storage_config.optical_flow_signature_dir)
+                                        config.optical_flow_storage.signature_dir)
             os.makedirs(signature_dir, exist_ok=True)
 
             # Initialize motion pattern database
             db_path = os.path.join(storage_config.local_storage_path,
-                                  storage_config.optical_flow_database_path)
+                                  config.optical_flow_storage.database_path)
 
             motion_pattern_db = MotionPatternDatabase(db_path=db_path,
                                                      signature_dir=signature_dir)
@@ -1184,12 +1205,16 @@ async def index():
         ts_pos["ts_pos_bl"] = "selected"
     else:  # bottom-right is default
         ts_pos["ts_pos_br"] = "selected"
-    
+
+    # Get connection count thread-safely
+    with active_connections_lock:
+        conn_count = len(active_connections)
+
     return HTML_TEMPLATE.format(
         width=camera_config.width,
         height=camera_config.height,
         frame_rate=camera_config.frame_rate,
-        connection_count=len(active_connections),
+        connection_count=conn_count,
         timestamp_checked=timestamp_checked,
         motion_checked=motion_checked,
         highlight_checked=highlight_checked,
@@ -1213,8 +1238,10 @@ async def video_feed(request: Request):
             detail="Server busy. Maximum number of clients reached."
         )
     
-    active_connections.append(client_id)
-    logger.info(f"Client {client_id} connected. Active connections: {len(active_connections)}")
+    with active_connections_lock:
+        active_connections.append(client_id)
+        conn_count = len(active_connections)
+    logger.info(f"Client {client_id} connected. Active connections: {conn_count}")
     
     async def generate():
         try:
@@ -1238,10 +1265,12 @@ async def video_feed(request: Request):
             logger.error(f"Streaming error for client {client_id}: {e}")
         finally:
             # Clean up client resources
-            if client_id in active_connections:
-                active_connections.remove(client_id)
+            with active_connections_lock:
+                if client_id in active_connections:
+                    active_connections.remove(client_id)
+                conn_count = len(active_connections)
             frame_buffer.unregister_client(client_id)
-            logger.info(f"Client {client_id} disconnected. Active connections: {len(active_connections)}")
+            logger.info(f"Client {client_id} disconnected. Active connections: {conn_count}")
     
     return StreamingResponse(
         generate(),
@@ -1251,8 +1280,15 @@ async def video_feed(request: Request):
 @app.get("/status")
 async def get_status():
     """Get server status information"""
+    # Get motion state thread-safely
+    detected, _, _ = motion_state.get_status()
+
+    # Get connection count thread-safely
+    with active_connections_lock:
+        conn_count = len(active_connections)
+
     return {
-        "active_connections": len(active_connections),
+        "active_connections": conn_count,
         "camera_initialized": camera_initialized,
         "camera_config": {
             "width": camera_config.width,
@@ -1268,15 +1304,18 @@ async def get_status():
             "motion_min_area": camera_config.motion_min_area,
             "highlight_motion": camera_config.highlight_motion
         },
-        "motion_detected": motion_detected
+        "motion_detected": detected
     }
 
 @app.get("/motion_status")
 async def get_motion_status():
     """Get motion detection status with optical flow classification"""
+    # Get motion state thread-safely
+    detected, regions, history = motion_state.get_status()
+
     # Process motion history with classification info
     history_with_classification = []
-    for item in motion_history[-camera_config.motion_history_size:]:
+    for item in history[-camera_config.motion_history_size:]:
         if len(item) == 3:  # New format: (timestamp, regions, classification)
             timestamp, regions, classification = item
             entry = {
@@ -1293,10 +1332,14 @@ async def get_motion_status():
                 "regions": regions
             })
 
+    # Get connection count thread-safely
+    with active_connections_lock:
+        conn_count = len(active_connections)
+
     return {
-        "motion_detected": motion_detected,
+        "motion_detected": detected,
         "motion_history": history_with_classification,
-        "active_connections": len(active_connections),
+        "active_connections": conn_count,
         "optical_flow_enabled": camera_config.optical_flow_enabled and optical_flow_analyzer is not None
     }
 
@@ -1569,7 +1612,7 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
     Returns:
         Tuple of (motion_detected, regions, flow_features)
     """
-    global prev_frame, motion_history, optical_flow_analyzer
+    global optical_flow_analyzer
 
     if frame is None or not camera_config.motion_detection:
         return False, [], None
@@ -1585,12 +1628,15 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
         blur_kernel = camera_config.motion_blur if camera_config.motion_blur % 2 == 1 else camera_config.motion_blur + 1
         gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
 
+        # Get previous frame from thread-safe state
+        prev_frame = motion_state.get_prev_frame()
+
         # If first frame or prev_frame is None, initialize it
         if prev_frame is None:
             logger.info(f"[MOTION_FLOW] {frame_time} Initializing first frame for motion detection")
-            prev_frame = gray
+            motion_state.update_prev_frame(gray)
             return False, [], None
-        
+
         # Calculate absolute difference between current and previous frame
         frame_delta = cv2.absdiff(prev_frame, gray)
         
@@ -1617,8 +1663,8 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
             regions.append((x, y, w, h))
             motion_detected = True
         
-        # Update previous frame
-        prev_frame = gray
+        # Update previous frame in thread-safe state
+        motion_state.update_prev_frame(gray)
 
         # Initialize flow features
         flow_features = None
@@ -1636,23 +1682,20 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
         if should_process_flow:
             try:
                 # Optionally downscale for performance
-                if hasattr(storage_config, 'optical_flow_max_resolution'):
-                    max_w, max_h = storage_config.optical_flow_max_resolution
-                    h, w = frame.shape[:2]
-                    if w > max_w or h > max_h:
-                        scale = min(max_w / w, max_h / h)
-                        new_w, new_h = int(w * scale), int(h * scale)
-                        frame_scaled = cv2.resize(frame, (new_w, new_h))
-                        prev_frame_scaled = cv2.resize(prev_color_frame, (new_w, new_h))
+                max_w, max_h = config.optical_flow.max_resolution
+                h, w = frame.shape[:2]
+                if w > max_w or h > max_h:
+                    scale = min(max_w / w, max_h / h)
+                    new_w, new_h = int(w * scale), int(h * scale)
+                    frame_scaled = cv2.resize(frame, (new_w, new_h))
+                    prev_frame_scaled = cv2.resize(prev_color_frame, (new_w, new_h))
 
-                        # Scale regions to match downscaled frame
-                        regions_scaled = [(int(x*scale), int(y*scale), int(w*scale), int(h*scale))
-                                         for x, y, w, h in regions]
+                    # Scale regions to match downscaled frame
+                    regions_scaled = [(int(x*scale), int(y*scale), int(w*scale), int(h*scale))
+                                     for x, y, w, h in regions]
 
-                        flow_features = optical_flow_analyzer.extract_flow(
-                            prev_frame_scaled, frame_scaled, regions_scaled)
-                    else:
-                        flow_features = optical_flow_analyzer.extract_flow(prev_color_frame, frame, regions)
+                    flow_features = optical_flow_analyzer.extract_flow(
+                        prev_frame_scaled, frame_scaled, regions_scaled)
                 else:
                     flow_features = optical_flow_analyzer.extract_flow(prev_color_frame, frame, regions)
 
@@ -1660,10 +1703,8 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
                 logger.error(f"Error extracting optical flow: {e}")
                 flow_features = None
 
-        # If motion is detected, add to history
+        # If motion is detected, update motion state
         if motion_detected:
-            motion_time = datetime.datetime.now()
-
             # Generate real-time classification (optional, only if visualization enabled)
             classification = None
             if (flow_features and optical_flow_analyzer and
@@ -1677,11 +1718,8 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
                 except Exception as e:
                     logger.error(f"Error generating real-time classification: {e}")
 
-            motion_history.append((motion_time, regions, classification))
-
-            # Trim history if needed
-            if len(motion_history) > camera_config.motion_history_size * 2:  # Keep twice the display size for history
-                motion_history = motion_history[-camera_config.motion_history_size * 2:]
+            # Update thread-safe motion state (handles history trimming internally)
+            motion_state.update_detection(motion_detected, regions, classification)
 
             # Log with high visibility to track motion detection precisely
             contour_areas = [cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= camera_config.motion_min_area]
@@ -1759,33 +1797,90 @@ def parse_arguments():
 # Main entry point
 if __name__ == "__main__":
     try:
-        # Parse command line arguments
+        # Load configuration using centralized system (handles CLI args, env vars, config file)
+        # Parse with old argument parser for backward compatibility
+        # But we'll use centralized config as primary source
         args = parse_arguments()
-        
-        # Update camera configuration with command line arguments
-        camera_config.width = args.width
-        camera_config.height = args.height
-        camera_config.frame_rate = args.fps
-        camera_config.rotation = args.rotation
-        camera_config.max_clients = args.max_clients
-        camera_config.client_timeout = args.client_timeout
-        camera_config.show_timestamp = not args.no_timestamp
-        camera_config.timestamp_position = args.timestamp_position
-        camera_config.motion_detection = not args.no_motion
-        camera_config.motion_threshold = args.motion_threshold
-        camera_config.motion_min_area = args.motion_min_area
-        camera_config.highlight_motion = not args.no_highlight
-        
-        # Set up storage configuration from arguments
-        storage_config = StorageConfig()
-        storage_config.local_storage_path = args.storage_path
-        storage_config.max_disk_usage_mb = args.max_storage
-        storage_config.remote_storage_url = args.remote_url
-        storage_config.remote_api_key = args.api_key
-        storage_config.upload_throttle_kbps = 0 if args.no_upload else args.upload_throttle
-        storage_config.wifi_monitoring = not args.no_wifi_monitoring
-        storage_config.generate_thumbnails = not args.no_thumbnails
-        
+
+        # Load centralized configuration
+        config_file = None  # Could add --config arg to parse_arguments()
+        config = get_config(config_file=config_file)
+
+        # Apply command-line argument overrides to centralized config
+        # Camera settings
+        if args.width != 640:  # Not default
+            config.camera.width = args.width
+        if args.height != 480:
+            config.camera.height = args.height
+        if args.fps != 30:
+            config.camera.frame_rate = args.fps
+        if args.rotation != 0:
+            config.camera.rotation = args.rotation
+        if args.max_clients != 10:
+            config.camera.max_clients = args.max_clients
+        if args.client_timeout != 30:
+            config.camera.client_timeout = args.client_timeout
+        config.camera.show_timestamp = not args.no_timestamp
+        if args.timestamp_position != "bottom-right":
+            config.camera.timestamp_position = args.timestamp_position
+
+        # Motion detection settings
+        config.motion_detection.enabled = not args.no_motion
+        if args.motion_threshold != 25:
+            config.motion_detection.threshold = args.motion_threshold
+        if args.motion_min_area != 500:
+            config.motion_detection.min_area = args.motion_min_area
+        config.motion_detection.highlight_motion = not args.no_highlight
+
+        # Storage settings
+        if args.storage_path != "/tmp/motion_events":
+            config.storage.local_storage_path = args.storage_path
+        if args.max_storage != 1000:
+            config.storage.max_disk_usage_mb = args.max_storage
+        if args.remote_url != "http://192.168.1.100:8080/storage":
+            config.storage.remote_storage_url = args.remote_url
+        if args.api_key != "your_api_key_here":
+            config.storage.remote_api_key = args.api_key
+        if args.no_upload:
+            config.storage.upload_throttle_kbps = 0
+        elif args.upload_throttle != 500:
+            config.storage.upload_throttle_kbps = args.upload_throttle
+        config.storage.wifi_monitoring = not args.no_wifi_monitoring
+        config.storage.generate_thumbnails = not args.no_thumbnails
+
+        # Create a flat camera_config that merges camera + motion_detection for backward compat
+        from dataclasses import dataclass
+        @dataclass
+        class FlatCameraConfig:
+            pass
+
+        camera_config = FlatCameraConfig()
+        # Copy camera settings
+        for attr in ['width', 'height', 'frame_rate', 'rotation', 'max_clients', 'client_timeout',
+                     'show_timestamp', 'timestamp_position', 'timestamp_color', 'timestamp_size']:
+            setattr(camera_config, attr, getattr(config.camera, attr))
+
+        # Copy motion detection settings with motion_ prefix
+        camera_config.motion_detection = config.motion_detection.enabled
+        camera_config.motion_threshold = config.motion_detection.threshold
+        camera_config.motion_min_area = config.motion_detection.min_area
+        camera_config.motion_blur = config.motion_detection.blur_kernel_size
+        camera_config.highlight_motion = config.motion_detection.highlight_motion
+        camera_config.motion_history_size = config.motion_detection.history_size
+
+        # Copy optical flow settings
+        camera_config.optical_flow_enabled = config.optical_flow.enabled
+        camera_config.optical_flow_feature_max = config.optical_flow.feature_max
+        camera_config.optical_flow_min_distance = config.optical_flow.min_distance
+        camera_config.optical_flow_quality_level = config.optical_flow.quality_level
+        camera_config.optical_flow_grid_size = config.optical_flow.grid_size
+        camera_config.optical_flow_direction_bins = config.optical_flow.direction_bins
+        camera_config.optical_flow_visualization = config.optical_flow.visualization
+        camera_config.optical_flow_frame_skip = config.optical_flow.frame_skip
+
+        # Set storage_config to point to centralized config
+        storage_config = config.storage
+
         # Log configuration
         logger.info(f"Starting server with configuration:")
         logger.info(f"  Camera: {camera_config.width}x{camera_config.height} @ {camera_config.frame_rate}fps")
@@ -1797,7 +1892,7 @@ if __name__ == "__main__":
         logger.info(f"  Upload throttle: {storage_config.upload_throttle_kbps} KB/s")
         logger.info(f"  WiFi monitoring: {'Enabled' if storage_config.wifi_monitoring else 'Disabled'}")
         logger.info(f"  Thumbnail generation: {'Enabled' if storage_config.generate_thumbnails else 'Disabled'}")
-        
+
         # Run the server with a timeout for graceful shutdown
         uvicorn.run(
             app,

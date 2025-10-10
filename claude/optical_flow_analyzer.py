@@ -5,6 +5,12 @@ Optical Flow Analysis Module for Motion Classification
 This module provides functionality to analyze motion patterns using optical flow techniques.
 It is designed to work with the existing motion detection system to classify movements
 as different object types (people, vehicles, animals, etc.) based on their motion signatures.
+
+This module is compatible with centralized configuration from config.py.
+The OpticalFlowAnalyzer accepts a config dictionary that can be generated from:
+  - config.optical_flow dataclass
+  - Manual dictionary construction
+  - Legacy configuration objects
 """
 
 import cv2
@@ -19,6 +25,13 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 import threading
 import pickle
 from pathlib import Path
+
+# Import centralized configuration (optional)
+try:
+    from config import OpticalFlowConfig
+    _has_centralized_config = True
+except ImportError:
+    _has_centralized_config = False
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -603,7 +616,7 @@ class MotionPatternDatabase:
     def __init__(self, db_path='motion_patterns.db', signature_dir='motion_signatures'):
         """
         Initialize the motion pattern database.
-        
+
         Args:
             db_path: Path to SQLite database file
             signature_dir: Directory to store signature files
@@ -614,6 +627,9 @@ class MotionPatternDatabase:
         # Lock for thread safety (must be initialized before _init_database)
         self.lock = threading.Lock()
 
+        # Thread-local storage for database connections (connection pooling)
+        self._local = threading.local()
+
         # Create signature directory if it doesn't exist
         os.makedirs(self.signature_dir, exist_ok=True)
 
@@ -622,24 +638,39 @@ class MotionPatternDatabase:
 
         logger.info("MotionPatternDatabase initialized at %s", db_path)
 
+    def _get_connection(self):
+        """Get or create a thread-local database connection."""
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self.db_path)
+            self._local.conn.row_factory = sqlite3.Row
+        return self._local.conn
+
+    def _close_connection(self):
+        """Close the thread-local database connection."""
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            self._local.conn.close()
+            self._local.conn = None
+
     def _init_database(self):
         """Initialize the SQLite database schema."""
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_connection()
             c = conn.cursor()
-            
+
             # Create tables if they don't exist
             c.execute('''
             CREATE TABLE IF NOT EXISTS motion_patterns (
                 id TEXT PRIMARY KEY,
+                pattern_id TEXT NOT NULL,
                 timestamp TEXT,
+                created_at TEXT,
                 classification TEXT,
                 confidence REAL,
                 metadata TEXT,
                 signature_path TEXT
             )
             ''')
-            
+
             c.execute('''
             CREATE TABLE IF NOT EXISTS labels (
                 cluster_id INTEGER PRIMARY KEY,
@@ -647,9 +678,8 @@ class MotionPatternDatabase:
                 description TEXT
             )
             ''')
-            
+
             conn.commit()
-            conn.close()
 
     def add_pattern(self, pattern_id, motion_signature, classification=None, metadata=None):
         """
@@ -685,24 +715,26 @@ class MotionPatternDatabase:
                 )
                 
                 # Store metadata in database
-                conn = sqlite3.connect(self.db_path)
+                conn = self._get_connection()
                 c = conn.cursor()
-                
+
+                now = datetime.now().isoformat()
                 c.execute('''
-                INSERT OR REPLACE INTO motion_patterns 
-                (id, timestamp, classification, confidence, metadata, signature_path)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO motion_patterns
+                (id, pattern_id, timestamp, created_at, classification, confidence, metadata, signature_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     pattern_id,
-                    datetime.now().isoformat(),
+                    pattern_id,  # pattern_id same as id for simplicity
+                    now,
+                    now,  # created_at same as timestamp
                     classification['label'] if classification else 'unknown',
                     classification['confidence'] if classification else 0.0,
                     json.dumps(metadata) if metadata else '{}',
                     signature_path
                 ))
-                
+
                 conn.commit()
-                conn.close()
                 
                 return True
             except Exception as e:
@@ -721,16 +753,14 @@ class MotionPatternDatabase:
         """
         with self.lock:
             try:
-                conn = sqlite3.connect(self.db_path)
-                conn.row_factory = sqlite3.Row
+                conn = self._get_connection()
                 c = conn.cursor()
-                
+
                 c.execute('''
                 SELECT * FROM motion_patterns WHERE id = ?
                 ''', (pattern_id,))
-                
+
                 row = c.fetchone()
-                conn.close()
                 
                 if not row:
                     return None
@@ -801,8 +831,7 @@ class MotionPatternDatabase:
             return []
 
         # Get all patterns from database
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT id as pattern_id, signature_path FROM motion_patterns')
         all_patterns = cursor.fetchall()
@@ -852,7 +881,6 @@ class MotionPatternDatabase:
                     'metadata': json.loads(row[2]) if row[2] else {}
                 })
 
-        conn.close()
         return results
 
     def _cosine_similarity(self, vec1, vec2):
@@ -888,11 +916,11 @@ class MotionPatternDatabase:
         """
         with self.lock:
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = self._get_connection()
                 c = conn.cursor()
-                
+
                 c.execute('''
-                UPDATE motion_patterns 
+                UPDATE motion_patterns
                 SET classification = ?, confidence = ?
                 WHERE id = ?
                 ''', (
@@ -900,9 +928,8 @@ class MotionPatternDatabase:
                     classification['confidence'],
                     pattern_id
                 ))
-                
+
                 conn.commit()
-                conn.close()
                 
                 return True
             except Exception as e:
