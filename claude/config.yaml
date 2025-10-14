@@ -28,6 +28,11 @@ motion_detection:
   blur_kernel_size: 21
   highlight_motion: true
   history_size: 50
+  # Region merging - groups nearby motion detections into single events
+  # Set merge_threshold higher (100-200) to merge more aggressively
+  # Set to 0 or disable merge_regions to keep all detections separate
+  merge_regions: true
+  merge_threshold: 50  # Distance in pixels
 optical_flow:
   enabled: true
   feature_max: 100

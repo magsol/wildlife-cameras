@@ -1601,6 +1601,59 @@ def add_timestamp(frame):
         logger.error(f"Error adding timestamp: {e}")
         return frame
 
+def merge_nearby_regions(regions, merge_threshold=50):
+    """
+    Merge motion regions that are close to each other (likely the same moving object).
+
+    Args:
+        regions: List of (x, y, w, h) tuples representing bounding boxes
+        merge_threshold: Maximum distance between regions to merge (pixels)
+
+    Returns:
+        List of merged regions
+    """
+    if len(regions) <= 1:
+        return regions
+
+    # Convert to mutable list of lists for easier manipulation
+    merged = []
+    used = set()
+
+    for i, region1 in enumerate(regions):
+        if i in used:
+            continue
+
+        x1, y1, w1, h1 = region1
+        # Start with this region
+        min_x, min_y = x1, y1
+        max_x, max_y = x1 + w1, y1 + h1
+
+        # Check all other regions
+        for j, region2 in enumerate(regions):
+            if i == j or j in used:
+                continue
+
+            x2, y2, w2, h2 = region2
+
+            # Calculate distance between region centers
+            center1_x, center1_y = x1 + w1/2, y1 + h1/2
+            center2_x, center2_y = x2 + w2/2, y2 + h2/2
+            distance = ((center1_x - center2_x)**2 + (center1_y - center2_y)**2)**0.5
+
+            # If regions are close, merge them
+            if distance < merge_threshold:
+                min_x = min(min_x, x2)
+                min_y = min(min_y, y2)
+                max_x = max(max_x, x2 + w2)
+                max_y = max(max_y, y2 + h2)
+                used.add(j)
+
+        # Add merged region
+        merged.append((int(min_x), int(min_y), int(max_x - min_x), int(max_y - min_y)))
+        used.add(i)
+
+    return merged
+
 def detect_motion(frame, prev_color_frame=None, frame_index=0):
     """
     Detect motion in frame and return motion regions with optical flow features.
@@ -1658,11 +1711,15 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
         for contour in contours:
             if cv2.contourArea(contour) < camera_config.motion_min_area:
                 continue
-                
+
             # Get bounding box coordinates
             (x, y, w, h) = cv2.boundingRect(contour)
             regions.append((x, y, w, h))
             motion_detected = True
+
+        # Merge nearby regions (group regions that are part of the same moving object)
+        if camera_config.motion_merge_regions and len(regions) > 1:
+            regions = merge_nearby_regions(regions, merge_threshold=camera_config.motion_merge_threshold)
         
         # Update previous frame in thread-safe state
         motion_state.update_prev_frame(gray)
@@ -1705,10 +1762,9 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
                 logger.error(f"Error extracting optical flow: {e}")
                 flow_features = None
 
-        # If motion is detected, update motion state
+        # Generate real-time classification (only if motion detected and visualization enabled)
+        classification = None
         if motion_detected:
-            # Generate real-time classification (optional, only if visualization enabled)
-            classification = None
             if (flow_features and optical_flow_analyzer and
                 camera_config.optical_flow_visualization):
                 try:
@@ -1719,9 +1775,6 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
                             classification = optical_flow_analyzer.classify_motion(signature)
                 except Exception as e:
                     logger.error(f"Error generating real-time classification: {e}")
-
-            # Update thread-safe motion state (handles history trimming internally)
-            motion_state.update_detection(motion_detected, regions, classification)
 
             # Log with high visibility to track motion detection precisely
             contour_areas = [cv2.contourArea(c) for c in contours if cv2.contourArea(c) >= camera_config.motion_min_area]
@@ -1734,6 +1787,9 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
                            f"Classification: {classification['label']} ({classification['confidence']:.2f})")
             else:
                 logger.info(f"[MOTION_FLOW] {frame_time} Motion detected! Regions: {len(regions)}, Contour areas: {contour_areas}")
+
+        # ALWAYS update thread-safe motion state (even when False) to clear UI indicators
+        motion_state.update_detection(motion_detected, regions, classification)
 
         if not motion_detected and random.random() < 0.01:  # Log about 1% of non-motion frames to avoid excessive logging
             logger.debug(f"[MOTION_FLOW] {frame_time} No motion detected")

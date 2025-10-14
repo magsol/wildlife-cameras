@@ -57,6 +57,10 @@ class MotionDetectionConfig:
     highlight_motion: bool = True
     history_size: int = 50  # Number of motion events to keep in memory
 
+    # Region merging (group nearby detections into single motion event)
+    merge_regions: bool = True  # Enable merging of nearby motion regions
+    merge_threshold: int = 50  # Maximum distance (pixels) between regions to merge
+
 
 @dataclass
 class OpticalFlowConfig:
