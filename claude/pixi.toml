@@ -34,13 +34,17 @@ scikit-learn = "*"
 pytest = "*"
 pytest-mock = "*"
 
+[activation]
+# Enable access to system site-packages (required for picamera2 on Raspberry Pi)
+scripts = ["pixi-activation.sh"]
+
 [tasks]
 # System package installation task
 install-system-deps = { cmd = "echo 'On Raspberry Pi, run: sudo apt install python3-picamera2 --no-install-recommends'" }
 
 # Default environment tasks
-start = { cmd = "python fastapi_mjpeg_server_with_storage.py" }
-storage-server = { cmd = "python storage_server.py" }
+start = { cmd = "PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH python fastapi_mjpeg_server_with_storage.py" }
+storage-server = { cmd = "PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH python storage_server.py" }
 
 # Testing tasks
 test = { cmd = "pytest tests/" }

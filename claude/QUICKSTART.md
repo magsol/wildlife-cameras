@@ -177,6 +177,8 @@ cd ~/wildlife-camera
 pixi install  # Reads pixi.toml and installs all dependencies
 ```
 
+**Note**: Pixi is configured to automatically access system site-packages for `picamera2`. The `pixi-activation.sh` script adds `/usr/lib/python3/dist-packages` to `PYTHONPATH` so the pixi environment can use the system-installed picamera2 library.
+
 **Option B: Using pip**
 ```bash
 cd ~/wildlife-camera
