@@ -158,9 +158,6 @@ class StorageConfig:
     min_classification_confidence: float = 0.5
     save_flow_visualizations: bool = True
 
-    # Performance optimization
-    optical_flow_max_resolution: Tuple[int, int] = (320, 240)  # Downscale for flow computation
-
 # Circular buffer for RAM storage
 class CircularFrameBuffer:
     """Stores recent frames in RAM using a circular buffer"""

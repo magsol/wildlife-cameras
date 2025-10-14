@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CameraConfig:
     """Camera hardware and stream settings"""
+    # LIVE FEED RESOLUTION (shown in web UI)
+    # For 1080p: width=1920, height=1080
+    # For 720p: width=1280, height=720
+    # For performance: width=640, height=480
     width: int = 640
     height: int = 480
     frame_rate: int = 30
@@ -70,7 +74,12 @@ class OpticalFlowConfig:
 
     # Performance optimization
     frame_skip: int = 2  # Process every Nth frame
-    max_resolution: Tuple[int, int] = (320, 240)  # Downscale for processing
+
+    # OPTICAL FLOW PROCESSING RESOLUTION (downscaled for performance)
+    # This is NOT the live feed resolution - optical flow analysis uses
+    # a downscaled version to reduce CPU load. Keep this low (320x240 or lower).
+    max_resolution_width: int = 320
+    max_resolution_height: int = 240
 
     # Visualization (expensive)
     visualization: bool = False
@@ -106,7 +115,9 @@ class StorageConfig:
     transfer_schedule_start: int = 1  # 1 AM
     transfer_schedule_end: int = 5    # 5 AM
 
-    # Thumbnail generation
+    # Thumbnail generation (saved with motion events)
+    # THUMBNAIL RESOLUTION (for preview images saved to disk)
+    # These are small preview images, not the live feed or recorded video.
     generate_thumbnails: bool = True
     thumbnail_width: int = 320
     thumbnail_height: int = 240
@@ -129,7 +140,6 @@ class StorageConfig:
     motion_classification_enabled: bool = True
     min_classification_confidence: float = 0.5
     save_flow_visualizations: bool = True
-    optical_flow_max_resolution: Tuple[int, int] = (320, 240)
 
 
 @dataclass

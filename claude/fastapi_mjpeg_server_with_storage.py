@@ -1683,7 +1683,8 @@ def detect_motion(frame, prev_color_frame=None, frame_index=0):
         if should_process_flow:
             try:
                 # Optionally downscale for performance
-                max_w, max_h = config.optical_flow.max_resolution
+                max_w = config.optical_flow.max_resolution_width
+                max_h = config.optical_flow.max_resolution_height
                 h, w = frame.shape[:2]
                 if w > max_w or h > max_h:
                     scale = min(max_w / w, max_h / h)

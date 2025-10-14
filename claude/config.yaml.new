@@ -1,16 +1,4 @@
-# ==============================================================================
-# RESOLUTION SETTINGS GUIDE:
-# ==============================================================================
-# 1. camera.width/height     → LIVE FEED shown in web UI (change this for 1080p!)
-# 2. optical_flow.max_resolution_width/height → Downscaled for CPU performance
-# 3. storage.thumbnail_width/height → Small preview images saved with events
-# ==============================================================================
-
 camera:
-  # LIVE FEED RESOLUTION (web UI display)
-  # For 1080p: set width=1920, height=1080
-  # For 720p: set width=1280, height=720
-  # For performance: width=640, height=480 (current)
   width: 640
   height: 480
   frame_rate: 30
@@ -19,7 +7,10 @@ camera:
   client_timeout: 30
   show_timestamp: true
   timestamp_position: bottom-right
-  timestamp_color: [255, 255, 255]  # RGB format: [R, G, B]
+  timestamp_color: !!python/tuple
+  - 255
+  - 255
+  - 255
   timestamp_size: 0.7
 motion_detection:
   enabled: true
@@ -33,12 +24,11 @@ optical_flow:
   feature_max: 100
   min_distance: 7
   quality_level: 0.3
-  grid_size: [8, 8]  # Grid dimensions: [rows, columns]
+  grid_size: !!python/tuple
+  - 8
+  - 8
   direction_bins: 8
   frame_skip: 2
-  # OPTICAL FLOW PROCESSING RESOLUTION (NOT the live feed!)
-  # Optical flow analysis uses a downscaled version to reduce CPU load.
-  # Keep this low (320x240 or lower) for good performance.
   max_resolution_width: 320
   max_resolution_height: 240
   visualization: false
@@ -60,8 +50,6 @@ storage:
   transfer_schedule_active: true
   transfer_schedule_start: 1
   transfer_schedule_end: 5
-  # THUMBNAIL RESOLUTION (preview images saved with motion events)
-  # These are small preview images saved to disk, not the live feed.
   generate_thumbnails: true
   thumbnail_width: 320
   thumbnail_height: 240
@@ -73,6 +61,12 @@ storage:
   wifi_throttle_poor: 100
   wifi_throttle_medium: 300
   wifi_throttle_good: 800
+  store_optical_flow_data: true
+  optical_flow_signature_dir: flow_signatures
+  optical_flow_database_path: motion_patterns.db
+  motion_classification_enabled: true
+  min_classification_confidence: 0.5
+  save_flow_visualizations: true
 optical_flow_storage:
   store_data: true
   signature_dir: flow_signatures
