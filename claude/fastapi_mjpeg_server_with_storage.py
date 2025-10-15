@@ -1925,6 +1925,8 @@ if __name__ == "__main__":
         camera_config.motion_blur = config.motion_detection.blur_kernel_size
         camera_config.highlight_motion = config.motion_detection.highlight_motion
         camera_config.motion_history_size = config.motion_detection.history_size
+        camera_config.motion_merge_regions = config.motion_detection.merge_regions
+        camera_config.motion_merge_threshold = config.motion_detection.merge_threshold
 
         # Copy optical flow settings
         camera_config.optical_flow_enabled = config.optical_flow.enabled
